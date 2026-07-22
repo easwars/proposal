@@ -70,7 +70,6 @@ functionality:
   application-defined keyspace.
 * Identifying the matching key-range and choosing a server endpoint assigned to
   it.
-* Reporting real-time load metrics back to the sharding service.
 * Providing a fallback mechanism to route client traffic when assignments from
   the sharding service are unusable.
 
