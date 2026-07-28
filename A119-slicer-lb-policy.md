@@ -1,9 +1,9 @@
-# A119: Slicer LB Policy
-
-* Author(s): easwars
+A119: Slicer LB Policy
+----
+* Author: easwars
 * Approver: markdroth
 * Implemented in: TBD
-* Last updated: 2026-05-22
+* Last updated: 2026-07-27
 * Discussion at: TDB
 
 ## Abstract
@@ -34,7 +34,6 @@ The targets for traffic distribution, or resources, frequently include:
 
 * Application servers
 * Kubernetes pods within a cluster
-* Regions within a multi-regional service deployment
 
 Implementing a load balancing policy in gRPC that uses an auto-sharding service
 has applications in various scenarios, such as:
@@ -47,12 +46,10 @@ has applications in various scenarios, such as:
 
 * [A42: xDS Ring Hash LB Policy][A42]
 * [A52: gRPC xDS Custom Load Balancer Configuration][A52]
-* [A57: XdsClient Failure Mode Behavior][A57]
 * [A62: Pick First][A62]
 * [A74: xDS Config Tears][A74]
 * [A75: xDS Aggregate Cluster Behavior Fixes][A75]
-* [A92: xDS ExtAuthz Support][A92]
-* [A93: xDS ExtProc Support][A93]
+* [A94: OTel metrics for Subchannels][A94]
 * [A102: xDS GrpcService Support][A102]
 * [OSS DynamicSharding gRPC Protocol Spec](TBD)
 
@@ -78,9 +75,14 @@ Name Resolver and not from the sharding service.
 
 ### LB Policy Architecture
 
-The LB policy receives the following information from the Name Resolver apart from its configuration:
+![LB Policy Architecture](A119_graphics/slicer_lb_policy_architecture.png)
 
-* Endpoints with an optional hostname attribute
+The LB policy receives the following information from the Name Resolver apart
+from its configuration:
+
+* A set of endpoints where each endpoint may include an optional hostname
+  attribute. If this attribute is missing, the first address associated with the
+  endpoint shall serve as the hostname.
 * A "Channel Factory" that returns a fully functional gRPC Channel to the
   sharding service, given an opaque string specified in the configuration
 
@@ -250,15 +252,14 @@ function GroupByConnectivityState(indices, allEndpoints):
 The LB policy must support a fallback mechanism that utilizes all endpoints
 provided by the Name Resolver. There are two types of fallback:
 
-* Per-RPC fallback:
+* Per-slice fallback:
   * This happens when the LB policy contains valid endpoints and assignments,
     but all endpoints in the matching `SliceEntry` for an RPC are in
     `TRANSIENT_FAILURE`.
-* Total fallback:
+* Fallback at startup (see [section](#fallback-at-startup) for more details):
   * This happens when the following conditions are met:
-    * No valid assignments have been received from the sharding service
-    * Endpoints received from the Name Resolver
-    * Fallback timer has expired
+    * No valid assignments have been received from the sharding service, and,
+    * Initial assignment timer has expired
 
 Key considerations here:
 
@@ -269,6 +270,24 @@ Key considerations here:
 * The LB policy must continue using previously received good assignments from
   the sharding service, if it subsequently receives a bad one or if the
   connection to the sharding service fails.
+
+#### Fallback at startup
+
+Whenever the LB policy creates a new gRPC channel to the sharding service, it
+must start a timer for the duration specified by the
+`initial_assignment_timeout` field in the LB policy configuration. RPCs must
+remain queued until one of the following events occurs, at which point the
+policy builds a `SliceMap` and updates the gRPC Channel with a new `Picker`,
+which then retries the queued RPCs:
+
+* A valid assignment is received from the sharding service
+  * The new `Picker` uses this assignment for the retried RPCs.
+  * If the LB policy hasn't received endpoints from the Name Resolver yet, RPCs
+    will fail until endpoints are received.
+* The timer expires
+  * If fallback is enabled: RPCs are routed at random to all endpoints provided
+    by the Name Resolver.
+  * If fallback is disabled: RPCs fail until a valid assignment is received.
 
 ### Supported modes of operation
 
@@ -303,8 +322,7 @@ message SlicerLbConfig {
  // sharding service.
  string channel_factory_key = 1;
 
- // An identifier sent to the sharding service. Assignments and load reports are
- // scoped to this identifier.
+ // A unique ID sent to the sharding service to locate assignments.
  //
  // Can optionally contain a "%s" token that will be replaced with the
  // "Locality" before sending. If a "%s" token is present, but the "Locality"
@@ -316,22 +334,14 @@ message SlicerLbConfig {
  // is used to look up the matching key-range assigned by the sharding service.
  string slice_key_header_name = 3;
 
- // Mode used to pick an endpoint for a request.
- enum EndpointPickingMode {
-  RANDOM = 0;
- }
-
- // Mode used to pick an endpoint from a matching key range.
- // If unset, defaults to RANDOM.
- EndpointPickingMode slice_picking_mode = 4;
-
  // If true, fallback mechanism is enabled.
- bool enable_fallback = 5;
+ bool enable_fallback = 4;
 
- // A timeout value for fallback to kick in when no assignments have been
- // received from the sharding service.
+ // How long to wait for the initial assignment from the sharding service. If
+ // no assignment is received before the timer fires, the LB policy  will either
+ // go into fallback mode (if enable_fallback is true) or fail RPCs.
  // Defaults to 60 seconds if not specified.
- google.protobuf.Duration fallback_timeout = 6;
+ google.protobuf.Duration initial_assignment_timeout = 5;
 }
 ```
 
@@ -361,12 +371,13 @@ When the LB policy receives a configuration update, it must do the following:
 When the LB policy receives endpoints from the Name Resolver, it must do the
 following:
 
-* Create a `pick_first` child for every endpoint. The latter will create
-  subchannels for the addresses within the endpoints.
+* Create a `pick_first` child, lazily, for every endpoint. The latter will create
+  subchannels for the addresses within the endpoints. See [this
+  section](#interactions-with-pick_first) for more details.
 * Update the `EndpointMap` accordingly.
-* Build a new `SliceMap`. See section [Building the
-  SliceMap](#building-the-slicemap) for more information.
-* Build a new `Picker` that uses the above `SliceMap`.
+* Build a new `SliceMap` unless the initial assignment timer is active. See
+  section [Building the SliceMap](#building-the-slicemap) for more information.
+  * Build a new `Picker` that uses the above `SliceMap`.
 
 If the LB policy receives an empty set of endpoints from the Name Resolver, it
 must set the connectivity state of the gRPC channel to `TRANSIENT_FAILURE` and
@@ -378,6 +389,9 @@ received.
 The LB policy will be injected with a “Channel Factory” via attributes,
 alongside its configuration. This utility will help create a fully functional
 gRPC Channel given the `channel_factory_key` in the LB policy configuration.
+Implementations must ensure the key uniquely encodes all parameters necessary
+for channel creation. For example, credentials need only be included in the key
+if the factory supports creating channels with different credentials.
 
 In xDS-based deployments, this “Channel Factory” will be injected by the
 `cds_experimental` LB policy. Refer to section [Changes to CDS LB
@@ -455,9 +469,9 @@ message currently contains three fields:
   of the LB policy configuration. If a `%s` tokens is present in this string, it
   is replaced with the “Locality” value  passed to the LB policy as attributes
   in the resolver update (similar to how the “Channel Factory” is passed).
-  * In xDS use-cases, “Locality” attributes is already populated by the
-    `cds_experimental` LB policy, for consumption by the locality picking
-    policy.
+  * In xDS use-cases, the “Locality” value is already populated by the
+    `cds_experimental` LB policy as a per-endpoint attribute, for consumption by
+    the locality picking policy. See [gRFC A94][A94] for more details.
   * In non-xDS use-cases, the common case is for the `slicing_target` to not
     contain `%s` tokens. But if they do, it is the responsibility of the user to
     ensure that this attribute is populated by the Name Resolver. If this
@@ -495,16 +509,9 @@ When a `Shard` stream fails without receiving at least one good logical
 assignment, the LB policy must use exponential backoff before each successive
 attempt to re-establish the stream. The algorithm should be similar to what gRPC
 uses for connection attempts. The backoff state will be reset when a `Shard`
-stream finally receives a good logical assignment from the server.
-
-Implementations should use the `wait_for_ready` option on the `Shard` stream to
-help recover faster from connectivity failures instead of applying a backoff
-when stream creation fails. This is in contrast to what the XdsClient does (as
-described in [gRFC A57][A57]), and is considered acceptable here because the LB
-policy will continue using previously received good assignments if they exist.
-If there are no previously received assignments, the LB policy must use the
-fallback option described in the section [Fallback
-mechanism](#fallback-mechanism) section.
+stream finally receives a good logical assignment from the server. If there are
+no previously received assignments, the LB policy must use the fallback option
+described in the section [Fallback mechanism](#fallback-mechanism) section.
 
 #### Handling assignments from the sharding server
 
@@ -583,7 +590,8 @@ function Pick(info):
   if sliceEntry.endpoints.inFallback and fallback_enabled:
       return PickFromPool(sliceMap.fallbackPool, info)
 
-  // Delegate to matching key-range.
+  // Delegate to matching key-range. In per-slice fallback cases, this will
+  // yeild a better error message.
   return PickFromPool(sliceEntry.endpoints, info)
 
 
@@ -700,39 +708,29 @@ import "envoy/config/core/v3/grpc_service.proto";
 
 message Slicer {
  // Configuration for the gRPC service that the LB policy will communicate with
- // to receive sharding assignments from and to send load reports to.
- config.core.v3.GrpcService grpc_service = 1
+ // to receive sharding assignments from.
+ config.core.v3.GrpcService grpc_service = 1;
 
- // An identifier sent to the sharding service. Assignments and load reports are
- // scoped to this identifier.
+ // A unique ID sent to the sharding service to locate assignments.
  //
- // Can optionally contain up to two "%s" tokens. The first is replaced with the
- // "Backend Service" and the second with the "Locality" before sending. If a
- // token is present, but the corresponding information is not available to the
- // LB policy, the token will be replaced with an empty string.
+ // Can optionally contain a "%s" token that will be replaced with the
+ // "Locality" before sending. If a "%s" token is present, but the "Locality"
+ // information is not available to the LB policy, the token will be replaced
+ // with an empty string.
  string slicing_target = 2;
 
  // Name of the request header containing the application-defined key. This key
- // is used to look up the matching key range (slice) assigned by the sharding
- // service.
+ // is used to look up the matching key-range assigned by the sharding service.
  string slice_key_header_name = 3;
 
- // Mode used to pick an endpoint for a request.
- enum EndpointPickingMode {
-  RANDOM = 0;
- }
-
- // Mode used to pick an endpoint from a matching key range.
- // If unset, defaults to RANDOM.
- EndpointPickingMode slice_picking_mode = 4;
-
  // If true, fallback mechanism is enabled.
- bool enable_fallback = 5;
+ bool enable_fallback = 4;
 
- // A timeout value for fallback to kick in when no assignments have been
- // received from the sharding service.
+ // How long to wait for the initial assignment from the sharding service. If
+ // no assignment is received before the timer fires, the LB policy  will either
+ // go into fallback mode (if enable_fallback is true) or fail RPCs.
  // Defaults to 60 seconds if not specified.
- google.protobuf.Duration fallback_timeout = 6;
+ google.protobuf.Duration initial_assignment_timeout = 5;
 }
 ```
 
@@ -921,10 +919,8 @@ TBD
 
 [A42]: A42-xds-ring-hash-lb-policy.md
 [A52]: A52-xds-custom-lb-policies.md
-[A57]: A57-xds-client-failure-mode-behavior.md
 [A62]: A62-pick-first.md
 [A74]: A74-xds-config-tears.md
 [A75]: A75-xds-aggregate-cluster-behavior-fixes.md
-[A92]: https://github.com/grpc/proposal/pull/481
-[A93]: https://github.com/grpc/proposal/pull/484
+[A94]: A94-subchannel-otel-metrics.md
 [A102]: https://github.com/grpc/proposal/pull/510
