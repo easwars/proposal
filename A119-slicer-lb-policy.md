@@ -50,6 +50,7 @@ has applications in various scenarios, such as:
 * [A74: xDS Config Tears][A74]
 * [A75: xDS Aggregate Cluster Behavior Fixes][A75]
 * [A78: gRPC OTel Metrics for WRR, Pick First, and XdsClient][A78]
+* [A81: xDS Authority Rewriting][A81]
 * [A102: xDS GrpcService Support][A102]
 * [A121: RPC Delay Observability][A121]
 * [OSS DynamicSharding gRPC Protocol Spec](TBD)
@@ -83,46 +84,43 @@ from its configuration:
 
 * A set of endpoints where each endpoint may include an optional hostname
   attribute. If this attribute is missing, the first address associated with the
-  endpoint shall serve as the hostname.
+  endpoint shall serve as the hostname. The endpoint hostname attribute
+  described in [gRFC A81][A81] will be used here.
 * A "Channel Factory" that returns a fully functional gRPC Channel to the
   sharding service, given an opaque string specified in the configuration
 
 The endpoints are stored in a map where the key is the hostname of the endpoint,
 and the value is the state associated with the endpoint. This state includes a
-`pick_first` child policy LB policy, and the most recent connectivity state and
-picker returned by that policy. We'll call this map the `EndpointMap` going
-forward. In Go, this could look like this:
+`pick_first` child policy LB policy that is created lazily, and the most recent
+connectivity state and picker returned by that policy. We'll call this map the
+`EndpointMap` going forward. This could look something like this:
 
-```golang
-type endpointMap struct {
-  m map[string]endpointState
-}
+```python
+class EndpointState:
+  child_lb: Balancer           # Child balancer managing the endpoint
+  state:    ConnectivityState  # Most recent connectivity state of the endpoint
+  picker:   Picker             # Most recent picker returned by the child balancer
 
-type endpointState struct {
-  childLB balancer.Balancer
-  state   connectivity.State
-  picker  balancer.Picker
-}
+class EndpointMap:
+  m: dict[str, EndpointState]  # Map from endpoint hostname to endpoiont state
 ```
 
 The LB policy must use the injected "Channel Factory" to create a gRPC channel
 to the sharding service, and must create a `Shard` stream on it. The sharding
 service will send assignments on this stream. These will be stored internally in
 a data structure named `LogicalAssignment`, and will contain key-ranges and
-their associated endpoint names. In Go, this could look like this:
+their associated endpoint names. This could look something like this:
 
-```golang
-type logicalAssignment struct {
- slices        []slice
- endpointNames []string
- generation    int64
-}
+```python
+class Slice:
+  start_key:  bytes      # Inclusive
+  end_key:    bytes      # Exclusive, None for sentinel
+  endpoints:  list[int]  # Indices into LogicalAssignment.endpoint_names
 
-type slice struct {
- startKey  []byte // Inclusive
- endKey    []byte // Exclusive, nil for sentinel
- endpoints []int  // Index into logicalAssignment.endpointNames
-}
+class LogicalAssignment:
+  slices:         list[Slice]  # List of non-overlapping key-range slice assignments
+  endpoint_names: list[str]    # Complete list of endpoint names in the assignment
+  generation:     int          # Generation number of the assignment
 ```
 
 `EndpointMap` and `LogicalAssignment` are combined into a data structure name
@@ -132,51 +130,52 @@ without any explicit synchronization with the LB policy.
 
 In Go, the `SliceMap` could look like this:
 
-```golang
- type sliceMap struct {
-  slices       []sliceEntry      // Sorted by startKey
-  allEndpoints []endpointState   // State of all endpoints across the assignment
-  fallbackPool assignedEndpoints // Precomputed indices & state buckets for all endpoints combined
-  generation   int64
- }
-  
- type sliceEntry struct {
-  startKey      []byte
-  endpointsPool assignedEndpoints
- }
-  
- type assignedEndpoints struct {
-  allEndpointsInSlice []int    // Indices into sliceMap.allEndpoints
-  endpointsByState    [5][]int // Array indexed directly by connectivity.State (ranges 0..4)
-  inFallback          bool
- }
+```python
+class AssignedEndpoints:
+  all_endpoints_in_slice: list[int] # Indices into SliceMap.all_endpoints
+  in_fallback:            bool      # True if no valid endpoints or all in TRANSIENT_FAILURE
+
+class SliceEntry:
+  start_key:      bytes             # Inclusive start key
+  endpoints_pool: AssignedEndpoints # Assigned endpoints for this slice
+
+class SliceMap:
+  slices:        list[SliceEntry]    # Sorted by start_key
+  all_endpoints: list[EndpointState] # State of all endpoints across the assignment
+  fallback_pool: AssignedEndpoints   # Includes all endpoints provided by resolver
+  generation:    int                 # Snapshot generation number
 ```
 
 Because assignments are pre-validated to have no gaps and cover the full key
-range, and since `slices` is sorted by `startKey`, the implementation of
-`sliceMap.lookup` boils down to a binary search to find the smallest index `i`
-where `slices[i].startKey > key`. Once we have `i`, index `i - 1` is what we are
-actually looking for. Here is a psuedo-code for it:
+range, and since `sliceMap.slices` is sorted by `startKey`, the implementation
+of `sliceMap.lookup` boils down to a binary search to find the smallest index
+`i` where `sliceMap.slices[i].startKey > key`. Once we have `i`, index `i - 1`
+is what we are actually looking for. Here is a psuedo-code for it:
 
-```golang
-func Lookup(key) sliceEntry:
-  // Total fallback case where LB policy does not have usable assignments.
-  if empty(sliceMap.slices):
-      return nil
+```python
+def lookup(self, key: bytes) -> SliceEntry | None:
+  # Handle the fallback-at-startup case where the policy has no assignments.
+  if not self.slices:
+    return None
 
-  // Binary search for key comparing against sliceEntry.startKey.
-  // BinarySearch returns:
-  // - found = true  if slices[idx].startKey == key
-  // - found = false if key is not an exact startKey match;
-  //           idx is the first slice where slices[idx].startKey > key
-  (idx, found) = BinarySearch(sliceMap.slices, key, by startKey)
+  # Binary search for key, comparing against slice_entry.start_key.
+  # Returns (idx, found):
+  # - found = True  if slices[idx].start_key == key
+  # - found = False if key is not an exact start_key match;
+  #           idx is the insertion index (first slice where start_key > key).
+  idx, found = binary_search(self.slices, key, key_func=lambda se: se.start_key)
 
-  // Exact match on startKey ([startKey, nextStartKey)).
+  # Exact match on start_key ([start_key, next_start_key)).
   if found:
-      return sliceMap.slices[idx]
+    return self.slices[idx]
 
-  // Key falls inside the range [slices[idx - 1].startKey, slices[idx].startKey).
-  return sliceMap.slices[idx - 1]
+  # Key is smaller than the start_key of the very first slice.
+  # TODO: Confirm if this case needs to be handled.
+  if idx == 0:
+    return None
+
+  # Key falls inside the range [slices[idx - 1].start_key, slices[idx].start_key).
+  return self.slices[idx - 1]
 ```
 
 #### Building the SliceMap
@@ -185,68 +184,76 @@ The `SliceMap` is generated from the `EndpointMap` and `LogicalAssignment` when
 either of them change. Here is the pseudo-code for the logic to build the
 `SliceMap`:
 
-```text
-function NewSliceMap(endpointMap, logicalAssignment):
-  sliceMap = new SliceMap()
+```python
+def new_slice_map(endpoint_map: EndpointMap, assignment: LogicalAssignment | None) -> SliceMap:
+  slice_map = SliceMap()
 
-  // No logical assignment received yet. Initialize for total fallback.
-  if logicalAssignment is nil: 
-      for each (name, state) in endpointMap:
-          sliceMap.allEndpoints.append(state)
-      sliceMap.fallbackPool = GroupByConnectivityState(all indices in sliceMap.allEndpoints)
-      return sliceMap
+  # No logical assignment received yet. Fallback at startup.
+  # Populate all_endpoints and fallback_pool directly from all resolved endpoints.
+  if assignment is None:
+    for state in endpoint_map.m.values():
+      slice_map.all_endpoints.append(state)
 
-  // Endpoints mentioned in the assignment that are missing from endpointMap are
-  // skipped.
-  validIndices = bitmap of size len(logicalAssignment.endpointNames) initialized to false
-  fallbackIndices = []
+    # all_indices will be [0, 1, ..., N-1] where N is the number of endpoints
+    # returned by the Name Resolver.
+    all_indices = list(range(len(slice_map.all_endpoints)))
+    slice_map.fallback_pool = create_pool_for_indices(all_indices, slice_map.all_endpoints)
+    return slice_map
 
-  // Align slots 0 .. N-1 with logicalAssignment.endpointNames so slice index
-  // references match.
-  for i = 0 to len(logicalAssignment.endpointNames) - 1:
-      name = logicalAssignment.endpointNames[i]
-      if name exists in endpointMap:
-          sliceMap.allEndpoints[i] = endpointMap[name]
-          validIndices[i] = true
-          fallbackIndices.append(i)
+  slice_map.generation = assignment.generation
 
-  // Append resolver endpoints not mentioned in logicalAssignment to
-  // allEndpoints so fallbackPool includes 100% of endpoints provided by the
-  // Name Resolver.
-  for each (name, endpointState) in endpointMap:
-      if name not in logicalAssignment.endpointNames:
-          fallbackIndices.append(len(sliceMap.allEndpoints))
-          sliceMap.allEndpoints.append(endpointState)
+  # Match endpoints in assignment with resolved endpoints in endpoint_map.
+  # Slots 0..N-1 align 1:1 with assignment.endpoint_names so slice indices
+  # remain valid.
+  num_assigned = len(assignment.endpoint_names)
+  valid_indices = [False] * num_assigned # A bit-map of size N
+  fallback_indices = []
 
-  // Precompute fallback candidates grouped by connectivity state
-  sliceMap.fallbackPool = GroupByConnectivityState(fallbackIndices, sliceMap.allEndpoints)
+  slice_map.all_endpoints = [None] * num_assigned
+  seen_in_assignment = set(assignment.endpoint_names)
 
-  // Build slice entries (assumed pre-sorted in the logicalAssignment)
-  for each slice in logicalAssignment.slices:
-      validSliceEndpoints = filter slice.endpoints keeping only indices where validIndices[idx] == true
-      sliceMap.slices.append(SliceEntry{
-          startKey:  slice.startKey,
-          endpoints: GroupByConnectivityState(validSliceEndpoints, sliceMap.allEndpoints)
-      })
+  for i, name in enumerate(assignment.endpoint_names):
+      if name in endpoint_map.m:
+          slice_map.all_endpoints[i] = endpoint_map.m[name]
+          valid_indices[i] = True
+          fallback_indices.append(i)
 
-  return sliceMap
+  # Append resolver endpoints NOT mentioned in assignment to all_endpoints,
+  # ensuring fallback_pool includes 100% of endpoints provided by the Name
+  # Resolver.
+  for name, state in endpoint_map.m.items():
+      if name not in seen_in_assignment:
+          fallback_indices.append(len(slice_map.all_endpoints))
+          slice_map.all_endpoints.append(state)
 
-function GroupByConnectivityState(indices, allEndpoints):
-  assigned = AssignedEndpoints{
-      allEndpointsInSlice: indices,
-      endpointsByState:    array of 5 empty lists  // O(1) direct slot access, no hash map
-  }
+  # Precompute fallback pool across all resolved endpoints
+  slice_map.fallback_pool = create_pool_for_indices(fallback_indices, slice_map.all_endpoints)
 
-  for each idx in indices:
-      state = allEndpoints[idx].state              // e.g., Ready (2)
-      assigned.endpointsByState[state].append(idx)
+  # Build slice entries (assumed pre-sorted by start_key in the assignment)
+  for slice_data in assignment.slices:
+      # Keep only endpoint indices that were found in endpoint_map
+      valid_slice_endpoints = [idx for idx in slice_data.endpoints if valid_indices[idx]]
 
-  // Marked inFallback=true if it has zero valid endpoints or if all of its
-  // assigned endpoints are in TRANSIENT_FAILURE.
-  allTF = (len(indices) > 0) and (len(assigned.endpointsByState[TransientFailure]) == len(indices))
-  assigned.inFallback = (len(indices) == 0) or allTF
+      slice_map.slices.append(SliceEntry(
+          start_key      = slice_data.start_key,
+          endpoints_pool = create_pool_for_indices(valid_slice_endpoints, slice_map.all_endpoints)
+      ))
 
-  return assigned
+  return slice_map
+
+
+def create_pool_for_indices(indices: list[int], all_endpoints: list[EndpointState]) -> AssignedEndpoints:
+    # A pool is in fallback if it contains zero valid endpoints or if all
+    # assigned endpoints are in TRANSIENT_FAILURE.
+    if not indices:
+        return AssignedEndpoints(all_endpoints_in_slice=[], in_fallback=True)
+
+    all_tf = all(all_endpoints[i].state == ConnectivityState.TRANSIENT_FAILURE for i in indices)
+
+    return AssignedEndpoints(
+        all_endpoints_in_slice = indices,
+        in_fallback            = all_tf
+    )
 ```
 
 ### Fallback Mechanism
@@ -284,8 +291,6 @@ which then retries the queued RPCs:
 
 * A valid assignment is received from the sharding service
   * The new `Picker` uses this assignment for the retried RPCs.
-  * If the LB policy hasn't received endpoints from the Name Resolver yet, RPCs
-    will fail until endpoints are received.
 * The timer expires
   * If fallback is enabled: RPCs are routed at random to all endpoints provided
     by the Name Resolver.
@@ -949,5 +954,6 @@ TBD
 [A74]: A74-xds-config-tears.md
 [A75]: A75-xds-aggregate-cluster-behavior-fixes.md
 [A78]: A78-grpc-metrics-wrr-pf-xds.md
-[A102]: https://github.com/grpc/proposal/pull/510
-[A121]: https://github.com/grpc/proposal/pull/556
+[A81]: A81-xds-authority-rewriting.md
+[A102]: <https://github.com/grpc/proposal/pull/510>
+[A121]: <https://github.com/grpc/proposal/pull/556>
