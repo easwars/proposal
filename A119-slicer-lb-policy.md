@@ -671,21 +671,32 @@ follows:
 5. If there is at least one subchannel in `IDLE` state, report `IDLE`.
 6. Otherwise, report `TRANSIENT_FAILURE`.
 
-Other similarilities to `ring_hash` include the following:
+Because the LB policy etablishes connections lazily in response to RPCs, it
+starts off in `IDLE` and not `CONNECTING`, list most other LB policies. The LB
+policy uses a heuristic and reports `TRANSIENT_FAILURE` when at least two
+subchannels are in `TRANSIENT_FAILURE` and none of the subchannels are `READY`.
+This heuristic is an attempt to to balance the need to allow the `priority`
+policy to quickly failover to the next priority and the desire to avoid
+reporting the entire policy as having failed when the problem is just one
+individual subchannel that happens to be unreachable.
 
-* The LB policy starts off in `IDLE` and not `CONNECTING`, because it
-  establishes connections lazily in response to RPCs.
-* The LB policy uses a heuristic and reports `TRANSIENT_FAILURE` when at least
-  two subchannels are in `TRANSIENT_FAILURE` and none of the subchannels are
-  `READY`.
-  * This heuristic is an attempt to to balance the need to allow the `priority`
-    policy to quickly failover to the next priority and the desire to avoid
-    reporting the entire policy as having failed when the problem is just one
-    individual subchannel that happens to be unreachable.
-* When the LB policy reports `TRANSIENT_FAILURE` or `CONNECTING`, it ensures
-  that there is at least one subchannel that is actively trying to connect,
-  giving itself a chance to move to `READY` even when it is not receiving any
-  picks.
+When the LB policy receives an connectivity state update from any of its child
+policies or receives a resolver update and computes the aggregated connectivity
+state that turns out to be `TRANSIENT_FAILURE` or `CONNECTING`, it must ensure
+that there is at least one subchannel that is actively trying to connect, giving
+itself a chance to move to `READY` even when it is not receiving any picks. One
+possible implementation of this is shown in the following pseudo-code:
+
+```text
+if aggregatedConnectivityState is CONNECTING or TRANSIENT_FAILURE:
+  if num(endpoints in CONNECTING) == 0:
+    if num(endpoints in IDLE) != 0:
+      Find a random endpoint in IDLE and connect to it.
+```
+
+An efficient way to implement the above algorithm is to keep track of the first
+IDLE endpoint while iterating through all endpoints to determine the aggregated
+connectivity state.
 
 ### xDS integration
 
