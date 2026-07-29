@@ -49,8 +49,9 @@ has applications in various scenarios, such as:
 * [A62: Pick First][A62]
 * [A74: xDS Config Tears][A74]
 * [A75: xDS Aggregate Cluster Behavior Fixes][A75]
-* [A94: OTel metrics for Subchannels][A94]
+* [A78: gRPC OTel Metrics for WRR, Pick First, and XdsClient][A78]
 * [A102: xDS GrpcService Support][A102]
+* [A121: RPC Delay Observability][A121]
 * [OSS DynamicSharding gRPC Protocol Spec](TBD)
 
 ## Proposal
@@ -127,8 +128,9 @@ type slice struct {
 `EndpointMap` and `LogicalAssignment` are combined into a data structure name
 `SliceMap`, which is optimized for lookups. Given a key, it returns a matching
 key-range. The `SliceMap` must be immutable, allowing the Picker to access it
-without any explicit synchronization with the LB policy. In Go, the `SliceMap`
-could look like this:
+without any explicit synchronization with the LB policy.
+
+In Go, the `SliceMap` could look like this:
 
 ```golang
  type sliceMap struct {
@@ -139,8 +141,8 @@ could look like this:
  }
   
  type sliceEntry struct {
-  startKey  []byte
-  endpoints assignedEndpoints
+  startKey      []byte
+  endpointsPool assignedEndpoints
  }
   
  type assignedEndpoints struct {
@@ -156,8 +158,8 @@ range, and since `slices` is sorted by `startKey`, the implementation of
 where `slices[i].startKey > key`. Once we have `i`, index `i - 1` is what we are
 actually looking for. Here is a psuedo-code for it:
 
-```text
-function Lookup(key):
+```golang
+func Lookup(key) sliceEntry:
   // Total fallback case where LB policy does not have usable assignments.
   if empty(sliceMap.slices):
       return nil
@@ -288,6 +290,10 @@ which then retries the queued RPCs:
   * If fallback is enabled: RPCs are routed at random to all endpoints provided
     by the Name Resolver.
   * If fallback is disabled: RPCs fail until a valid assignment is received.
+
+While RPCs are queued waiting for one of the above events to happen, the
+`Picker` must set `delay_type` to "slicer_assignment_pending". See [WIP gRFC
+A121][A121].
 
 ### Supported modes of operation
 
@@ -469,9 +475,16 @@ message currently contains three fields:
   of the LB policy configuration. If a `%s` tokens is present in this string, it
   is replaced with the “Locality” value  passed to the LB policy as attributes
   in the resolver update (similar to how the “Channel Factory” is passed).
-  * In xDS use-cases, the “Locality” value is already populated by the
-    `cds_experimental` LB policy as a per-endpoint attribute, for consumption by
-    the locality picking policy. See [gRFC A94][A94] for more details.
+  * In xDS use-cases, the “Locality” value is currently populated by the
+    `weighted_target_experimental` LB policy as a resolver state attribute, and
+    is available to all LB policies that sit underneath it.
+    * When the `slicer_experimental` LB policy is used for endpoint picking
+      alone, it will sit underneath the `weighted_target_experimental` LB
+      policy, and therefore will have access to this resolver attribute. See
+      [gRFC A78][A78] for more details.
+    * When the `slicer_experimental` LB policy is used for both locality and
+      endpoint picking, the “Locality” value will not be part of the slicing
+      target as the policy will handle endpoints from all localities.
   * In non-xDS use-cases, the common case is for the `slicing_target` to not
     contain `%s` tokens. But if they do, it is the responsibility of the user to
     ensure that this attribute is populated by the Name Resolver. If this
@@ -554,18 +567,9 @@ with the newly built `SliceMap` and send an update to the gRPC channel.
 The LB policy must create a new picker every time a new `SliceMap` is built. The
 picker is given the `SliceMap` and the `slice_key_header_name` field from the LB
 policy configuration, from which it can extract the key for the incoming
-request.
-
-There is a small optimization that can prevent connection storms at startup and
-ensure that the number of connection attempts scale with the number of RPCs.
-This optimization involves two things:
-
-* The LB policy will not send a new picker update when the child policy for an
-  endpoint moves from IDLE to CONNECTING.
-* The picker will maintain mutable atomic state on a per-endpoint basis in the
-  `SliceMap` that indicates if a connection attempt was started for an endpoint
-  that is marked to be in IDLE state. This field must only be written to by the
-  picker.
+request. When constructing the picker, if there is at least one endpoint in
+CONNECTING state, the LB policy must set the `hasEndpointInConnectingState`
+field of the picker to `true`.
 
 Here is the pseudo-code for the `Pick` method of the picker:
 
@@ -581,66 +585,55 @@ function Pick(info):
   // assignments have been received from the sharding service.
   if sliceEntry is nil:
     if fallback_enabled:
-      return PickFromPool(sliceMap.fallbackPool, info)
+      return PickFromAssignedEndpoints(sliceMap.fallbackPool, info)
     else
       return PICK_FAILED
 
 
   // Matching key-range is in fallback mode.
-  if sliceEntry.endpoints.inFallback and fallback_enabled:
-      return PickFromPool(sliceMap.fallbackPool, info)
+  if sliceEntry.endpointsPool.inFallback and fallback_enabled:
+      return PickFromAssignedEndpoints(sliceMap.fallbackPool, info)
 
   // Delegate to matching key-range. In per-slice fallback cases, this will
   // yeild a better error message.
-  return PickFromPool(sliceEntry.endpoints, info)
+  return PickFromAssignedEndpoints(sliceEntry.endpointsPool, info)
 
 
-function PickFromPool(pool, info):
+// Picks an endpoint from the pool, which is of type `assignedEndpoints`.
+function PickFromAssignedEndpoints(pool, info):
   // Queue the pick when no endpoints exist in this pool. This happens when Name
   // Resolver update trails assignments.
   if empty(pool.allEndpointsInSlice):
+    // TODO: Do we need a new delay_type here?
     return PICK_QUEUE
 
-  if pool.inFallback:
-    randomEndpoint = PickRandom(pool.allEndpointsInSlice)
-    return randomEndpoint.picker.Pick(info)
+  // Pick a random endpoint within the slice.
+  firstIndex = PickRandomIndex(pool.allEndpointsInSlice)
 
-  // Pick a random endpoint.
-  ep = PickRandom(pool.allEndpointsInSlice)
+  // Loop through all endpoints in the slice starting at the above random index,
+  // and delegate to the first READY endpoint. If there is no endpoint in
+  // CONNECTING state, request a connection on the first IDLE endpoint.
 
-  // Happy Path
-  if ep.state == READY:
-    return ep.picker.Pick(info)
+  requestedConnection = picker.hasEndpointInConnectingState
+  for i = 0 to len(pool.allEndpointsInSlice) - 1:
+    // Find the actual endpoint from the SliceMap.
+    index = (firstIndex + i) % len(pool.allEndpointsInSlice);
+    ep = sliceMap.allEndpoints[pool.allEndpointsInSlice[index]];
 
-  if ep.state == IDLE:
-    // Use atomic CAS so only the first RPC triggers connection.
-    if ep.connectTriggered.CompareAndSwap(false, true):
+    if ep.state == READY:
+      return ep.picker.Pick(info)
+    if !requested_connection && ep.state == IDLE:
       ep.childLB.ExitIdle()
-    
-    // If there is a READY endpoint, delegate to it. Else queue pick.
-    if not empty(pool.readyList):
-      readyEp = PickRandom(pool.readyList)
-      return readyEp.picker.Pick(info)
-    else
-      return PICK_QUEUE
+      requestedConnection = true
 
-  // Randomly selected endpoint is CONNECTING or TF
-
-  // If there is at least one truly IDLE endpoint, wake it up.
-  for each idleEp in pool.idleList:
-    if idleEp.connectTriggered.CompareAndSwap(false, true):
-      idleEp.childLB.ExitIdle()
-      break 
-
-  if not empty(pool.readyList):
-    readyEp = PickRandom(pool.readyList)
-    return readyEp.picker.Pick(info)
-
-  // If there is at least one truly CONNECTING endpoint, queue pick.
-  if not empty(pool.connectingList) or any(idleEp in pool.idleList where idleEp.connectTriggered == true):
+  // If we did not find any READY endpoints, but requested connection on an IDLE
+  // endpoint, queue the pick.
+  if requestedConnection:
+    // Set delay_type to "connecting".
     return PICK_QUEUE
 
-  // Delegate to TF picker to fail RPC with connection status.
+  // All children are in transient failure. Return the first failure.
+  ep = sliceMap.allEndpoints[pool.allEndpointsInSlice[firstIndex]];
   return ep.picker.Pick(info)
 ```
 
@@ -652,7 +645,7 @@ in the picker pseudo-code. `slicer_experimental` must create a `pick_first`
 child for every endpoint given to it by the Name Resolver. `pick_first` starts
 connecting as soon as it is given its endpoint. So, `slicer_experimental` must
 make sure that the child `pick_first` policy is created lazily, when a
-connection to that endpoint needs to be established. This maybe accomplished by
+connection to that endpoint needs to be established. This may be accomplished by
 wrapping `pick_first` in a parent policy that creates `pick_first` only when
 asked to establish a connection.
 
@@ -663,17 +656,36 @@ to reconnect with exponential backoff until they become `READY`.
 
 ### Aggregated Connectivity State
 
-The behavior will be exactly the same as that of the ring_hash policy, as
-described in [gRFC A42][A42]. Highlights here are:
+The LB policy will use the same rules used by the `ring_hash` LB policy, as
+described in [gRFC A42][A42] to determine the aggregated connectivity state of
+the gRPC Channel. The complete connectivity state aggregation rules are as
+follows:
 
-* The LB policy starts off in `IDLE`, unlike most policies that start off in
-  `CONNECTING`
+1. If there is at least one subchannel in `READY` state, report `READY`.
+2. If there are 2 or more subchannels in `TRANSIENT_FAILURE` state, report
+   `TRANSIENT_FAILURE`.
+3. If there is at least one subchannel in `CONNECTING` state, report
+   `CONNECTING`.
+4. If there is one subchannel in `TRANSIENT_FAILURE` and there is more than
+   one subchannel, report state `CONNECTING`.
+5. If there is at least one subchannel in `IDLE` state, report `IDLE`.
+6. Otherwise, report `TRANSIENT_FAILURE`.
+
+Other similarilities to `ring_hash` include the following:
+
+* The LB policy starts off in `IDLE` and not `CONNECTING`, because it
+  establishes connections lazily in response to RPCs.
 * The LB policy uses a heuristic and reports `TRANSIENT_FAILURE` when at least
   two subchannels are in `TRANSIENT_FAILURE` and none of the subchannels are
-  `READY`
+  `READY`.
+  * This heuristic is an attempt to to balance the need to allow the `priority`
+    policy to quickly failover to the next priority and the desire to avoid
+    reporting the entire policy as having failed when the problem is just one
+    individual subchannel that happens to be unreachable.
 * When the LB policy reports `TRANSIENT_FAILURE` or `CONNECTING`, it ensures
   that there is at least one subchannel that is actively trying to connect,
-  giving itself a chance to move to `READY` even when it is not getting picks.
+  giving itself a chance to move to `READY` even when it is not receiving any
+  picks.
 
 ### xDS integration
 
@@ -849,7 +861,8 @@ gRPC channels to the external services specified in the map. The newly created
 "Channel Factory" must then be injected as a resolver state attribute and passed
 down to the child policies.
 
-Post [gRFC A75][A75], the `cds_experimental` LB policy will not perform the above mentioned steps for aggregate clusters.
+Post [gRFC A75][A75], the `cds_experimental` LB policy will not perform the
+above mentioned steps for aggregate clusters.
 
 ### Temporary environment variable protection
 
@@ -902,7 +915,7 @@ appealing as well.
 
 The LB policy could be used by applications in two widely differing scenarios:
 
-* A reverse proxy where client requests arrive before being routed to the
+* A reverse-proxy where client requests arrive before being routed to the
   backend tasks of a sharded service. Here, traffic is expected to hit almost
   all key-ranges.
 * A client application communicating directly with a sharded service. Here,
@@ -911,7 +924,8 @@ The LB policy could be used by applications in two widely differing scenarios:
 While connecting to backends eagerly like `pick_first` or `round_robin` would
 work for the first case, it would be extermely wasteful in the second case. Most
 of our known use-cases fall into the second bucket and optimizing for that seems
-prudent.
+prudent. Connecting to backends lazily will work fine for the reverse-proxy case
+as well, as it will quickly wind up establishing connections to all endpoints.
 
 ## Implementation
 
@@ -922,5 +936,6 @@ TBD
 [A62]: A62-pick-first.md
 [A74]: A74-xds-config-tears.md
 [A75]: A75-xds-aggregate-cluster-behavior-fixes.md
-[A94]: A94-subchannel-otel-metrics.md
+[A78]: A78-grpc-metrics-wrr-pf-xds.md
 [A102]: https://github.com/grpc/proposal/pull/510
+[A121]: https://github.com/grpc/proposal/pull/556
