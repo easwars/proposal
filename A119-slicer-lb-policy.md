@@ -796,8 +796,9 @@ type ConverterOptions struct {
 // LBPolicyInfo contains information to be passed to the LB policy, outside of
 // its configuration.
 type LBPolicyInfo struct {
- // ParsedGRPCServices is a map from a deterministic hash of the contents of the
- // GrpcService proto to the parsed internal representation.
+ // ParsedGRPCServices is a map where the key is a string that uniquely
+ // identifies the contents of the GrpcService proto, and the value is the
+ // parsed internal representation.
  ParsedGRPCServices map[string]*grpcservice.GRPCService
 
 }
@@ -820,10 +821,10 @@ We need a map of GrpcServices to be passed from the xDS LB Registry to the
   [Cluster](https://github.com/envoyproxy/envoy/blob/d26361ac44e48ad347afbaff141c5c0387d48c40/api/envoy/config/cluster/v3/cluster.proto#L50)
   resource. This means that we could have multiple LB policies that contain a
   GrpcService proto in their configuration.
-* The key for this map needs to be a deterministic hash of the GrpcService proto
-  and not the target URI field inside of it, because we could have more than on
-  LB policy that wishes to communicate with the same external server, but use
-  different credentials.
+* The key for this map needs to be uniquely identify the contents of the
+  `GrpcService` proto and not just the target URI field inside of it, because we
+  could have more than one LB policy that wishes to communicate with the same
+  external server, but use different credentials.
 
 The converter for the `Slicer` xDS LB policy must set the `channel_factory_key`
 field of the `slicer_experimental` LB policy to contain the same value that is
