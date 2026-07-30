@@ -147,9 +147,9 @@ class SliceMap:
 ```
 
 Because assignments are pre-validated to have no gaps and cover the full key
-range, and since `sliceMap.slices` is sorted by `startKey`, the implementation
-of `sliceMap.lookup` boils down to a binary search to find the smallest index
-`i` where `sliceMap.slices[i].startKey > key`. Once we have `i`, index `i - 1`
+range, and since `SliceMap.slices` is sorted by `start_Key`, the implementation
+of `SliceMap.lookup` boils down to a binary search to find the smallest index
+`i` where `SliceMap.slices[i].start_Key > key`. Once we have `i`, index `i - 1`
 is what we are actually looking for. Here is a psuedo-code for it:
 
 ```python
@@ -169,8 +169,6 @@ def lookup(self, key: bytes) -> SliceEntry | None:
   if found:
     return self.slices[idx]
 
-  # Key is smaller than the start_key of the very first slice.
-  # TODO: Confirm if this case needs to be handled.
   if idx == 0:
     return None
 
