@@ -604,11 +604,10 @@ function Pick(info):
 
 // Picks an endpoint from the pool, which is of type `assignedEndpoints`.
 function PickFromAssignedEndpoints(pool, info):
-  // Queue the pick when no endpoints exist in this pool. This happens when Name
-  // Resolver update trails assignments.
   if empty(pool.allEndpointsInSlice):
-    // TODO: Do we need a new delay_type here?
-    return PICK_QUEUE
+    // This can be true only when the matching entry is in fallback mode
+    // (because of not having any endpoints) *and* fallback is disabled.
+    return PICK_FAILED
 
   // Pick a random endpoint within the slice.
   firstIndex = PickRandomIndex(pool.allEndpointsInSlice)
