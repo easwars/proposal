@@ -811,25 +811,21 @@ type ConverterOptions struct {
  // ServerConfig is the configuration of the xDS server from which the
  // resource was received.
  ServerConfig *bootstrap.ServerConfig
-}
 
-// LBPolicyInfo contains information to be passed to the LB policy, outside of
-// its configuration.
-type LBPolicyInfo struct {
  // ParsedGRPCServices is a map where the key is a string that uniquely
  // identifies the contents of the GrpcService proto, and the value is the
- // parsed internal representation.
+ // parsed internal representation. This is to be populated by converters that
+ // parse a GrpcService proto.
  ParsedGRPCServices map[string]*grpcservice.GRPCService
-
 }
 
 // Converter converts raw proto bytes into JSON LB policy configuration.
 // 
 // Returns the following:
 // - converted JSON form of the LB policy configuration
-// - Additional information to be passed to the LB policy, and,
 // - Any error encountered during the conversion.
-type Converter func(rawProto []byte, depth int, opts ConverterOptions) (json.RawMessage, LBPolicyInfo, error)
+// - Parsed GrpcService proto in ConverterOptions.
+type Converter func(rawProto []byte, depth int, opts ConverterOptions) (json.RawMessage, error)
 ```
 
 We need a map of GrpcServices to be passed from the xDS LB Registry to the
