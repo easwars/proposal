@@ -696,27 +696,39 @@ starts off in `IDLE` because it establishes connections lazily in response to
 RPCs. It uses a heuristic and reports `TRANSIENT_FAILURE` when at least two
 subchannels are in `TRANSIENT_FAILURE` and none of the subchannels are `READY`.
 This heuristic is an attempt to to balance the need to allow the `priority`
-policy to quickly failover to the next priority and the desire to avoid
-reporting the entire policy as having failed when the problem is just one
-individual subchannel that happens to be unreachable.
+policy (which would be an ancestor to this LB policy in the tree of LB policies
+used in xDS use-cases) to quickly failover to the next priority and the desire
+to avoid reporting the entire policy as having failed when the problem is just
+one individual subchannel that happens to be unreachable.
 
-When the LB policy receives an connectivity state update from any of its child
-policies or receives a resolver update and computes the aggregated connectivity
-state that turns out to be `TRANSIENT_FAILURE` or `CONNECTING`, it must ensure
-that there is at least one subchannel that is actively trying to connect, giving
-itself a chance to move to `READY` even when it is not receiving any picks. One
-possible implementation of this is shown in the following pseudo-code:
+The specific behavior that will enable this LB policy to stop reporting
+`TRANSIENT_FAILURE` even when it is not receiving picks will be that whenever
+this policy receives a subchannel connectivity state update or a resolver
+update, if the aggregated connectivity state is `TRANSIENT_FAILURE` or
+`CONNECTING` and there are no endpoints in `CONNECTING` state, the policy will
+choose one of the endpoints in `IDLE` state (if any) to trigger a connection
+attempt on. It does not matter which `IDLE` endpoint is chosen; that is left up
+to the implementation to determine. An efficient way to choose an `IDLE`
+endpoint is to keep track of the first `IDLE` endpoint while iterating through
+all endpoints to determine the aggregated connectivity state and use it directly.
 
-```text
-if aggregatedConnectivityState is CONNECTING or TRANSIENT_FAILURE:
-  if num(endpoints in CONNECTING) == 0:
-    if num(endpoints in IDLE) != 0:
-      Find a random endpoint in IDLE and connect to it.
+An alternative approach is shown in the following pseudo-code:
+
+```python
+if aggregated_state in (ConnectivityState.CONNECTING, ConnectivityState.TRANSIENT_FAILURE):
+  first_idle = None
+
+  for endpoint in endpoints:
+    if endpoint.state == ConnectivityState.CONNECTING:
+      first_idle = None
+      break
+    if first_idle is None and endpoint.state == ConnectivityState.IDLE:
+      first_idle = endpoint
+      break
+
+  if first_idle is not None:
+    first_idle.request_connection()
 ```
-
-An efficient way to implement the above algorithm is to keep track of the first
-IDLE endpoint while iterating through all endpoints to determine the aggregated
-connectivity state.
 
 ### xDS integration
 
