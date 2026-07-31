@@ -278,18 +278,28 @@ Key considerations here:
   the sharding service, if it subsequently receives a bad one or if the
   connection to the sharding service fails.
 
-#### Fallback at startup
+#### Fallback at Startup
 
-Whenever the LB policy creates a new gRPC channel to the sharding service, it
+Whenever the LB policy creates a new gRPC Channel to the sharding service, it
 must start a timer for the duration specified by the
-`initial_assignment_timeout` field in the LB policy configuration. RPCs must
-remain queued until one of the following events occurs, at which point the
-policy builds a `SliceMap` and updates the gRPC Channel with a new `Picker`,
-which then retries the queued RPCs:
+`initial_assignment_timeout` field in the LB policy configuration. There are two
+possible scenarios here:
 
-* A valid assignment is received from the sharding service
-  * The new `Picker` uses this assignment for the retried RPCs.
-* The timer expires
+* If the policy contains valid assignments from the previous gRPC Channel, it
+  must continue using them until it receives one from the new gRPC Channel or
+  the timer expires. While the timer is pending and the LB policy is using the
+  existing assignment, it must continue to process endpoint updates from the
+  Name Resolver and state updates from the child LB policies as normal.
+* If the policy does not contain valid assignments, it must queue RPCs until it
+  receives one from the new gRPC Channel or the timer expires.
+
+When the policy receives a valid assignment from the sharding server or the
+timer expires, it must build a `SliceMap` and update the parent gRPC Channel
+with a new `Picker`, which then retries any queued RPCs:
+
+* If a valid assignment was received from the sharding service, the new `Picker`
+  will this assignment for the retried RPCs.
+* If the timer expired:
   * If fallback is enabled: RPCs are routed at random to all endpoints provided
     by the Name Resolver.
   * If fallback is disabled: RPCs fail until a valid assignment is received.
@@ -947,6 +957,28 @@ work for the first case, it would be extermely wasteful in the second case. Most
 of our known use-cases fall into the second bucket and optimizing for that seems
 prudent. Connecting to backends lazily will work fine for the reverse-proxy case
 as well, as it will quickly wind up establishing connections to all endpoints.
+
+### Why use pre-existing assignments when moving to a new sharding service?
+
+In the [Fallback at Startup](#fallback-at-startup) section, we mentioned that
+the LB policy must continue using previously received valid assignments from the
+sharding server (for a configurable duration) when it creates a gRPC Channel to
+a new sharding service based on a configuration update. While it may seem wrong
+to use assignments from a sharding service that the LB policy is no longer
+expected to be communicating with, there are valid reasons for doing so.
+
+* Throwing away existing assignments would lead to RPCs getting queued until a
+  valid assignment is received, causing an unnecessary spike in latency.
+* Indefenitely using existing assignments until a valid one is received can lead
+  to an outage at a later point in time when the application restarts, making it
+  harder to debug.
+
+Adding a metric to surface this condition to the service operator makes it
+possible for them to deal with the issue before it turns into an outage. But the
+LB policy would need to know whether the service operators are monitoring such a
+metric, and we would need a configuration knob for this. Given that a change in
+the sharding service is a very rare event, we don't want to add support for it
+unless there is a valid use-case for it.
 
 ## Implementation
 
