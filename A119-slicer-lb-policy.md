@@ -612,8 +612,9 @@ function Pick(info):
   if sliceEntry.endpointsPool.inFallback and fallback_enabled:
       return PickFromAssignedEndpoints(sliceMap.fallbackPool, info)
 
-  // Delegate to matching key-range. In per-slice fallback cases, this will
-  // yeild a better error message.
+  // Delegate to matching key-range. 
+  // When the matching key-range is in fallback, but fallback is disabled, this
+  // will yeild a better error message.
   return PickFromAssignedEndpoints(sliceEntry.endpointsPool, info)
 
 
