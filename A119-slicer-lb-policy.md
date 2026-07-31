@@ -525,9 +525,14 @@ When a `Shard` stream fails without receiving at least one good logical
 assignment, the LB policy must use exponential backoff before each successive
 attempt to re-establish the stream. The algorithm should be similar to what gRPC
 uses for connection attempts. The backoff state will be reset when a `Shard`
-stream finally receives a good logical assignment from the server. If there are
-no previously received assignments, the LB policy must use the fallback option
-described in the section [Fallback mechanism](#fallback-mechanism) section.
+stream finally receives a good logical assignment from the server.
+Implementations should use the `wait_for_ready` option on the `Shard` stream to
+help recover faster from connectivity failures instead of applying a backoff
+when stream creation fails.
+
+If there are no previously received assignments, the LB policy must use the
+fallback option described in the section [Fallback
+mechanism](#fallback-mechanism) section.
 
 #### Handling assignments from the sharding server
 
@@ -625,6 +630,8 @@ function PickFromAssignedEndpoints(pool, info):
     if ep.state == READY:
       return ep.picker.Pick(info)
     if !requested_connection && ep.state == IDLE:
+      // This requires hopping into the WorkSerializer (C++) or
+      // SynchronizationContext (Java).
       ep.childLB.ExitIdle()
       requestedConnection = true
 
@@ -673,9 +680,9 @@ follows:
 5. If there is at least one subchannel in `IDLE` state, report `IDLE`.
 6. Otherwise, report `TRANSIENT_FAILURE`.
 
-Because the LB policy etablishes connections lazily in response to RPCs, it
-starts off in `IDLE` and not `CONNECTING`, list most other LB policies. The LB
-policy uses a heuristic and reports `TRANSIENT_FAILURE` when at least two
+Unlike most other LB policies, which start off in `CONNECTING`, this policy
+starts off in `IDLE` because it establishes connections lazily in response to
+RPCs. It uses a heuristic and reports `TRANSIENT_FAILURE` when at least two
 subchannels are in `TRANSIENT_FAILURE` and none of the subchannels are `READY`.
 This heuristic is an attempt to to balance the need to allow the `priority`
 policy to quickly failover to the next priority and the desire to avoid
