@@ -147,9 +147,9 @@ class SliceMap:
 ```
 
 Because assignments are pre-validated to have no gaps and cover the full key
-range, and since `SliceMap.slices` is sorted by `start_Key`, the implementation
+range, and since `SliceMap.slices` is sorted by `start_key`, the implementation
 of `SliceMap.lookup` boils down to a binary search to find the smallest index
-`i` where `SliceMap.slices[i].start_Key > key`. Once we have `i`, index `i - 1`
+`i` where `SliceMap.slices[i].start_key > key`. Once we have `i`, index `i - 1`
 is what we are actually looking for. Here is a psuedo-code for it:
 
 ```python
@@ -168,9 +168,6 @@ def lookup(self, key: bytes) -> SliceEntry | None:
   # Exact match on start_key ([start_key, next_start_key)).
   if found:
     return self.slices[idx]
-
-  if idx == 0:
-    return None
 
   # Key falls inside the range [slices[idx - 1].start_key, slices[idx].start_key).
   return self.slices[idx - 1]
@@ -246,7 +243,7 @@ def create_pool_for_indices(indices: list[int], all_endpoints: list[EndpointStat
     if not indices:
         return AssignedEndpoints(all_endpoints_in_slice=[], in_fallback=True)
 
-    all_tf = all(all_endpoints[i].state == ConnectivityState.TRANSIENT_FAILURE for i in indices)
+    all_tf = all(all_endpoints[i].state == TRANSIENT_FAILURE for i in indices)
 
     return AssignedEndpoints(
         all_endpoints_in_slice = indices,
@@ -540,10 +537,6 @@ Implementations should use the `wait_for_ready` option on the `Shard` stream to
 help recover faster from connectivity failures instead of applying a backoff
 when stream creation fails.
 
-If there are no previously received assignments, the LB policy must use the
-fallback option described in the section [Fallback
-mechanism](#fallback-mechanism) section.
-
 #### Handling assignments from the sharding server
 
 The sharding server implementing the OSS DynamicSharding gRPC protocol will
@@ -715,16 +708,15 @@ all endpoints to determine the aggregated connectivity state and use it directly
 An alternative approach is shown in the following pseudo-code:
 
 ```python
-if aggregated_state in (ConnectivityState.CONNECTING, ConnectivityState.TRANSIENT_FAILURE):
+if aggregated_state in (CONNECTING, TRANSIENT_FAILURE):
   first_idle = None
 
   for endpoint in endpoints:
-    if endpoint.state == ConnectivityState.CONNECTING:
+    if endpoint.state == CONNECTING:
       first_idle = None
       break
-    if first_idle is None and endpoint.state == ConnectivityState.IDLE:
+    if first_idle is None and endpoint.state == IDLE:
       first_idle = endpoint
-      break
 
   if first_idle is not None:
     first_idle.request_connection()
