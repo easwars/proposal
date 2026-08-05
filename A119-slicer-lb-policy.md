@@ -1018,7 +1018,7 @@ expected to be communicating with, there are valid reasons for doing so.
 
 * Throwing away existing assignments would lead to RPCs getting queued until a
   valid assignment is received, causing an unnecessary spike in latency.
-* Indefenitely using existing assignments until a valid one is received can lead
+* Indefinitely using existing assignments until a valid one is received can lead
   to an outage at a later point in time when the application restarts, making it
   harder to debug.
 
