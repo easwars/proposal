@@ -89,21 +89,57 @@ from its configuration:
 * A "Channel Factory" that returns a fully functional gRPC Channel to the
   sharding service, given an opaque string specified in the configuration
 
+#### EndpointMap
+
 The endpoints are stored in a map where the key is the hostname of the endpoint,
 and the value is the state associated with the endpoint. This state includes a
-`pick_first` child policy LB policy that is created lazily, and the most recent
+child `pick_first` LB policy that is created lazily, and the most recent
 connectivity state and picker returned by that policy. We'll call this map the
 `EndpointMap` going forward. This could look something like this:
 
 ```python
+# Endpoint state used in the LB policy.
 class EndpointState:
+  index:    int                # Index of the endpoint within the NR update
+  endpoint: Endpoint           # The actual endpoint returned by the NR
   child_lb: Balancer           # Child balancer managing the endpoint
   state:    ConnectivityState  # Most recent connectivity state of the endpoint
   picker:   Picker             # Most recent picker returned by the child balancer
 
+# Map from endpoint hostname to endpoiont state
 class EndpointMap:
-  m: dict[str, EndpointState]  # Map from endpoint hostname to endpoiont state
+  m: dict[str, EndpointState]
 ```
+
+The LB policy must create a new `EndpointMap` whenever it receives new endpoints
+from the Name Resolver.
+
+```python
+def build_endpoint_map(resolved_endpoints: list[Endpoint]) -> EndpointMap:
+  endpoint_map = EndpointMap(m={})
+  for index, endpoint in enumerate(resolved_endpoints):
+      endpoint_map.m[endpoint.hostname] = EndpointState(
+          index    = index,
+          endpoint = endpoint,
+      )
+  return endpoint_map
+```
+
+The LB policy should update the existing `EndpointMap` when it receives an
+update from the child policy. This means that the `EndpointMap` cannot be shared
+with the picker without synchronizing access to it. Instead, we propose creating
+a new data structure that contains only the fields from `EndpointState` that the
+`Picker` needs access to.
+
+```python
+# Endpoint state used in the picker.
+class PickerEndpoint:
+  state:    ConnectivityState
+  picker:   Picker
+  child_lb: Balancer           # Child balancer to request a connection to the endpoint
+```
+
+#### Assignment
 
 The LB policy must use the injected "Channel Factory" to create a gRPC channel
 to the sharding service, and must create a `Shard` stream on it. The sharding
@@ -123,27 +159,25 @@ class LogicalAssignment:
   generation:     int          # Generation number of the assignment
 ```
 
-`EndpointMap` and `LogicalAssignment` are combined into a data structure name
+#### SliceMap
+
+`EndpointMap` and `LogicalAssignment` are combined into a data structure named
 `SliceMap`, which is optimized for lookups. Given a key, it returns a matching
 key-range. The `SliceMap` must be immutable, allowing the Picker to access it
-without any explicit synchronization with the LB policy.
-
-In Go, the `SliceMap` could look like this:
+without any explicit synchronization with the LB policy. The `SliceMap` is meant
+to be used by the `Picker` in conjunction with a list of `PickerEndpoint`s such
+that the list can be swapped out, as long as the number and order of endpoints
+don't change.
 
 ```python
-class AssignedEndpoints:
-  all_endpoints_in_slice: list[int] # Indices into SliceMap.all_endpoints
-  in_fallback:            bool      # True if no valid endpoints or all in TRANSIENT_FAILURE
-
 class SliceEntry:
-  start_key:      bytes             # Inclusive start key
-  endpoints_pool: AssignedEndpoints # Assigned endpoints for this slice
+  start_key: bytes      # Inclusive start key
+  endpoints: list[int]  # Indices into list[PickerEndpoint] in Picker
 
 class SliceMap:
-  slices:        list[SliceEntry]    # Sorted by start_key
-  all_endpoints: list[EndpointState] # State of all endpoints across the assignment
-  fallback_pool: AssignedEndpoints   # Includes all endpoints provided by resolver
-  generation:    int                 # Snapshot generation number
+  slices:        list[SliceEntry] # Sorted by start_key
+  fallback_pool: list[int]        # Indices into list[PickerEndpoint] for resolver endpoints
+  generation:    int              # Snapshot generation number
 ```
 
 Because assignments are pre-validated to have no gaps and cover the full key
@@ -153,10 +187,11 @@ of `SliceMap.lookup` boils down to a binary search to find the smallest index
 is what we are actually looking for. Here is a psuedo-code for it:
 
 ```python
-def lookup(self, key: bytes) -> SliceEntry | None:
-  # Handle the fallback-at-startup case where the policy has no assignments.
+# Returns a tuple where the first value is an index into SliceMap.slices
+def lookup(self, key: bytes) -> tuple[int, SliceEntry] | tuple[None, None]:
+  # Handle the startup/fallback case where there are no assignments.
   if not self.slices:
-    return None
+    return None, None
 
   # Binary search for key, comparing against slice_entry.start_key.
   # Returns (idx, found):
@@ -165,12 +200,12 @@ def lookup(self, key: bytes) -> SliceEntry | None:
   #           idx is the insertion index (first slice where start_key > key).
   idx, found = binary_search(self.slices, key, key_func=lambda se: se.start_key)
 
-  # Exact match on start_key ([start_key, next_start_key)).
+  # Exact match on start_key.
   if found:
-    return self.slices[idx]
+      return idx, self.slices[idx]
 
-  # Key falls inside the range [slices[idx - 1].start_key, slices[idx].start_key).
-  return self.slices[idx - 1]
+  # Key falls in range [slices[idx - 1].start_key, slices[idx].start_key).
+  return idx - 1, self.slices[idx - 1]
 ```
 
 #### Building the SliceMap
@@ -180,75 +215,35 @@ either of them change. Here is the pseudo-code for the logic to build the
 `SliceMap`:
 
 ```python
-def new_slice_map(endpoint_map: EndpointMap, assignment: LogicalAssignment | None) -> SliceMap:
-  slice_map = SliceMap()
+def build_slice_map(endpoint_map: EndpointMap, assignment: LogicalAssignment | None) -> SliceMap:
+  slice_map = SliceMap(slices=[], fallback_pool=[], generation=0)
 
-  # No logical assignment received yet. Fallback at startup.
-  # Populate all_endpoints and fallback_pool directly from all resolved endpoints.
+  # Populate fallback_pool deterministically sorted by endpoint index.
+  slice_map.fallback_pool = [
+      es.index for es in sorted(endpoint_map.m.values(), key=lambda es: es.index)
+  ]
+
+  # If no assignment has been received yet (startup case), return early with
+  # empty slices.
   if assignment is None:
-    for state in endpoint_map.m.values():
-      slice_map.all_endpoints.append(state)
-
-    # all_indices will be [0, 1, ..., N-1] where N is the number of endpoints
-    # returned by the Name Resolver.
-    all_indices = list(range(len(slice_map.all_endpoints)))
-    slice_map.fallback_pool = create_pool_for_indices(all_indices, slice_map.all_endpoints)
-    return slice_map
+      return slice_map
 
   slice_map.generation = assignment.generation
 
-  # Match endpoints in assignment with resolved endpoints in endpoint_map.
-  # Slots 0..N-1 align 1:1 with assignment.endpoint_names so slice indices
-  # remain valid.
-  num_assigned = len(assignment.endpoint_names)
-  valid_indices = [False] * num_assigned # A bit-map of size N
-  fallback_indices = []
-
-  slice_map.all_endpoints = [None] * num_assigned
-  seen_in_assignment = set(assignment.endpoint_names)
-
-  for i, name in enumerate(assignment.endpoint_names):
-      if name in endpoint_map.m:
-          slice_map.all_endpoints[i] = endpoint_map.m[name]
-          valid_indices[i] = True
-          fallback_indices.append(i)
-
-  # Append resolver endpoints NOT mentioned in assignment to all_endpoints,
-  # ensuring fallback_pool includes 100% of endpoints provided by the Name
-  # Resolver.
-  for name, state in endpoint_map.m.items():
-      if name not in seen_in_assignment:
-          fallback_indices.append(len(slice_map.all_endpoints))
-          slice_map.all_endpoints.append(state)
-
-  # Precompute fallback pool across all resolved endpoints
-  slice_map.fallback_pool = create_pool_for_indices(fallback_indices, slice_map.all_endpoints)
-
-  # Build slice entries (assumed pre-sorted by start_key in the assignment)
+  # Build SliceEntry for each Slice in the assignment.
   for slice_data in assignment.slices:
-      # Keep only endpoint indices that were found in endpoint_map
-      valid_slice_endpoints = [idx for idx in slice_data.endpoints if valid_indices[idx]]
+    slice_entry = SliceEntry(start_key=slice_data.start_key, endpoints=[])
 
-      slice_map.slices.append(SliceEntry(
-          start_key      = slice_data.start_key,
-          endpoints_pool = create_pool_for_indices(valid_slice_endpoints, slice_map.all_endpoints)
-      ))
+    for idx in slice_data.endpoints:
+      # Map index -> hostname -> EndpointState.index
+      # Drop hostnames not present in the endpoint map.
+      hostname = assignment.endpoint_names[idx]
+      if hostname in endpoint_map.m:
+        slice_entry.endpoints.append(endpoint_map.m[hostname].index)
+
+    slice_map.slices.append(slice_entry)
 
   return slice_map
-
-
-def create_pool_for_indices(indices: list[int], all_endpoints: list[EndpointState]) -> AssignedEndpoints:
-    # A pool is in fallback if it contains zero valid endpoints or if all
-    # assigned endpoints are in TRANSIENT_FAILURE.
-    if not indices:
-        return AssignedEndpoints(all_endpoints_in_slice=[], in_fallback=True)
-
-    all_tf = all(all_endpoints[i].state == TRANSIENT_FAILURE for i in indices)
-
-    return AssignedEndpoints(
-        all_endpoints_in_slice = indices,
-        in_fallback            = all_tf
-    )
 ```
 
 ### Fallback Mechanism
@@ -566,83 +561,141 @@ endpoint names and each `Slice` within a chunk contains an index into the
 complete set of endpoint names, combined in chunk order. So, until all chunks
 are received, the LB policy cannot meaningfully use any of them.
 
-Once the `AssignmentMetadata` message is received, the LB policy must build a
-new `SliceMap`. If building the `SliceMap` fails, the LB policy must terminate
-the stream to the sharding service, and attempt to re-establish it.
+Once the `AssignmentMetadata` message is received, the LB policy must validate
+the assignment as follows:
 
-Once a `SliceMap` is built successfully, the LB policy must create a new picker
-with the newly built `SliceMap` and send an update to the gRPC channel.
+* Ensure that there are no gaps in the key-ranges represented by the `Slice`s.
+* Ensure all endpoint indices specified in the `Slice`s are valid once the
+  endpoint names are combined.
+
+If validation fails, the LB policy must terminate the stream to the sharding
+service, and attempt to re-establish it.
+
+Upon successful validation, the LB policy must build a new `SliceMap` and create
+a new picker with the newly built `SliceMap` and send an update to the gRPC
+channel.
 
 ### The Picker
 
-The LB policy must create a new picker every time a new `SliceMap` is built. The
-picker is given the `SliceMap` and the `slice_key_header_name` field from the LB
-policy configuration, from which it can extract the key for the incoming
-request. Here is the pseudo-code for the `Pick` method of the picker:
+The LB policy must create a new `Picker` every time a new `SliceMap` is built,
+which happens every time the LB policy receives new endpoints from the Name
+Resolver or new assignments from the sharding service. The LB policy must create
+a new `Picker` when it receives a state update from one of its child policies as
+well, but this time around, the existing `SliceMap` can be used.
+
+Here is the pseudo-code for the `Picker` method of the picker:
 
 ```python
-def pick(pick_args: PickArgs) -> PickResult:
-  # Extract the sharding key from the request metadata/header.
-  key = extract_key_from_metadata(pick_args, self.slice_key_header_name)
+class Picker:
+  slice_map:                 SliceMap
+  endpoints:                 list[PickerEndpoint] # Ordered 1:1 by EndpointState.index
+  slice_in_fallback:         list[bool]           # Precomputed per-slice in_fallback status
+  fallback_pool_in_fallback: bool                 # Precomputed fallback_pool in_fallback status
+  fallback_enabled:          bool
+  slice_key_header_name:     str
 
-  # Lookup the matching slice range for the key.
-  slice_entry = self.slice_map.lookup(key)
+  def __init__(self, endpoint_map: EndpointMap, slice_map: SliceMap, fallback_enabled: bool, slice_key_header_name: str):
+    self.slice_map             = slice_map
+    self.fallback_enabled      = fallback_enabled
+    self.slice_key_header_name = slice_key_header_name
+ 
+    # Build immutable snapshot of PickerEndpoints sorted by EndpointState.index.
+    self.endpoints = [
+        PickerEndpoint(
+            state    = es.state,
+            picker   = es.picker,
+            child_lb = es.child_lb
+        )
+        for es in sorted(endpoint_map.m.values(), key=lambda es: es.index)
+    ]
+ 
+    # Precompute in_fallback status for each slice and the fallback_pool.
+    self.slice_in_fallback = [
+        self._is_pool_in_fallback(se.endpoints)
+        for se in slice_map.slices
+    ]
+    self.fallback_pool_in_fallback = self._is_pool_in_fallback(slice_map.fallback_pool)
 
-  # No assignment exists for this key. This can only happen if no valid
-  # assignments have been received from the sharding service yet.
-  if slice_entry is None:
-    if self.fallback_enabled:
-      return pick_from_assigned_endpoints(self.slice_map.fallback_pool, pick_args)
-    else:
+  # A pool is in fallback if it contains zero valid endpoints or if all assigned
+  # endpoints are in TRANSIENT_FAILURE.
+  def _is_pool_in_fallback(self, indices: list[int]) -> bool:
+    if not indices:
+      return True
+    return all(self.endpoints[i].state == ConnectivityState.TRANSIENT_FAILURE for i in indices)
+
+  def pick(self, pick_args: PickArgs) -> PickResult:
+    # Extract sharding key from request metadata/header
+    key = extract_key_from_metadata(pick_args, self.slice_key_header_name)
+
+    # Lookup matching slice range index and SliceEntry
+    slice_idx, slice_entry = self.slice_map.lookup(key)
+
+    # No assignment covers this key (startup case)
+    if slice_idx is None:
+      if self.fallback_enabled:
+        return self.pick_from_endpoint_indices(
+          self.slice_map.fallback_pool,
+          self.fallback_pool_in_fallback,
+          pick_args
+        )
       return PICK_FAILED
 
-  # Matching key range is in fallback mode *and* fallback is enabled.
-  if slice_entry.endpoints_pool.in_fallback and self.fallback_enabled:
-    return pick_from_assigned_endpoints(self.slice_map.fallback_pool, pick_args)
+    # Matching key range is in fallback mode and fallback is enabled
+    if self.slice_in_fallback[slice_idx] and self.fallback_enabled:
+      return self.pick_from_endpoint_indices(
+        self.slice_map.fallback_pool,
+        self.fallback_pool_in_fallback,
+        pick_args
+      )
 
-  # Delegate to matching key range endpoint pool.
-  # When the matching key range is in fallback, but fallback is disabled, this
-  # will delegate to the slice endpoints to yield a better error message.
-  return pick_from_assigned_endpoints(slice_entry.endpoints_pool, pick_args)
+    # Delegate to assigned endpoints for the matching key range.
+    # When the matching key range is in fallback, but fallback is disabled, this
+    # will yield a better error message.
+    return self.pick_from_endpoint_indices(
+        slice_entry.endpoints,
+        self.slice_in_fallback[slice_idx],
+        pick_args
+    )
 
-def pick_from_assigned_endpoints(pool: AssignedEndpointsPool, pick_args: PickArgs) -> PickResult:
-  # This can be true only when the matching entry is in fallback mode
-  # (due to having zero endpoints) *and* fallback is disabled.
-  if not pool.endpoints:
-    return PICK_FAILED
+  def pick_from_endpoint_indices(self, indices: list[int], in_fallback: bool, pick_args: PickArgs) -> PickResult:
+    # This can be true only when the matching entry is in fallback mode
+    # (due to having zero endpoints) *and* fallback is disabled.
+    if not indices:
+      return PICK_FAILED
 
-  # Pick a random starting index within the pool.
-  first_index = random_index(pool.endpoints)
+    # Pick a random starting index within the pool
+    first_index = random_index(indices)
 
-  requested_connection = False
-  found_connecting     = False
+    requested_connection = False
+    found_connecting     = False
 
-  # Loop through all endpoints in the slice starting at first_index.
-  for i in range(len(pool.endpoints)):
-      index    = (first_index + i) % len(pool.endpoints)
-      endpoint = pool.endpoints[index]
+    # Iterate through candidate endpoints starting at first_index
+    for i in range(len(indices)):
+      ep_idx   = indices[(first_index + i) % len(indices)]
+      endpoint = self.endpoints[ep_idx]
 
-      # If the endpoint is READY, use it (Happy Path).
+      # If READY, use immediately (Happy Path)
       if endpoint.state == ConnectivityState.READY:
         return endpoint.picker.pick(pick_args)
 
-      # Record whether we see a CONNECTING endpoint.
+      # Record if we see a CONNECTING endpoint
       if endpoint.state == ConnectivityState.CONNECTING:
         found_connecting = True
 
-      # If we see an IDLE endpoint and haven't triggered a connection yet, do so now.
+      # If IDLE, trigger connection on the child LB (at most one per pick)
       if not requested_connection and endpoint.state == ConnectivityState.IDLE:
-        endpoint.request_connection()
+        endpoint.child_lb.exit_idle()
         requested_connection = True
 
-  # If no READY endpoint was found, but we either requested a connection
-  # or found a CONNECTING endpoint, queue the pick.
-  if requested_connection or found_connecting:
-      return PICK_QUEUE
+    # If no READY endpoint was found, but we requested a connection or found a
+    # CONNECTING endpoint, queue the pick
+    if requested_connection or found_connecting:
+        return PICK_QUEUE
 
-  # All endpoints are in TRANSIENT_FAILURE. Fail the pick by delegating to the
-  # randomly selected endpoint's picker to yield a detailed error message.
-  return pool.endpoints[first_index].picker.pick(pick_args)
+    # All endpoints are in TRANSIENT_FAILURE. Fail by delegating to the randomly
+    # picked endpoint's picker to yield a detailed error message
+    first_ep_idx = indices[first_index]
+    return self.endpoints[first_ep_idx].picker.pick(pick_args)
 ```
 
 ### Interactions with `pick_first`
