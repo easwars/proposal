@@ -578,76 +578,71 @@ with the newly built `SliceMap` and send an update to the gRPC channel.
 The LB policy must create a new picker every time a new `SliceMap` is built. The
 picker is given the `SliceMap` and the `slice_key_header_name` field from the LB
 policy configuration, from which it can extract the key for the incoming
-request. When constructing the picker, if there is at least one endpoint in
-CONNECTING state, the LB policy must set the `hasEndpointInConnectingState`
-field of the picker to `true`.
+request. Here is the pseudo-code for the `Pick` method of the picker:
 
-Here is the pseudo-code for the `Pick` method of the picker:
+```python
+def pick(pick_args: PickArgs) -> PickResult:
+  # Extract the sharding key from the request metadata/header.
+  key = extract_key_from_metadata(pick_args, self.slice_key_header_name)
 
-```text
-function Pick(info):
-  // Extract the key from the request header.
-  key = ExtractKeyFromMetadata(info, slice_key_header_name)
+  # Lookup the matching slice range for the key.
+  slice_entry = self.slice_map.lookup(key)
 
-  // Lookup the matching key-range.
-  sliceEntry = sliceMap.Lookup(key)
-
-  // No assignment exists for this key. This can only happen if no good
-  // assignments have been received from the sharding service.
-  if sliceEntry is nil:
-    if fallback_enabled:
-      return PickFromAssignedEndpoints(sliceMap.fallbackPool, info)
-    else
+  # No assignment exists for this key. This can only happen if no valid
+  # assignments have been received from the sharding service yet.
+  if slice_entry is None:
+    if self.fallback_enabled:
+      return pick_from_assigned_endpoints(self.slice_map.fallback_pool, pick_args)
+    else:
       return PICK_FAILED
 
+  # Matching key range is in fallback mode *and* fallback is enabled.
+  if slice_entry.endpoints_pool.in_fallback and self.fallback_enabled:
+    return pick_from_assigned_endpoints(self.slice_map.fallback_pool, pick_args)
 
-  // Matching key-range is in fallback mode.
-  if sliceEntry.endpointsPool.inFallback and fallback_enabled:
-      return PickFromAssignedEndpoints(sliceMap.fallbackPool, info)
+  # Delegate to matching key range endpoint pool.
+  # When the matching key range is in fallback, but fallback is disabled, this
+  # will delegate to the slice endpoints to yield a better error message.
+  return pick_from_assigned_endpoints(slice_entry.endpoints_pool, pick_args)
 
-  // Delegate to matching key-range. 
-  // When the matching key-range is in fallback, but fallback is disabled, this
-  // will yeild a better error message.
-  return PickFromAssignedEndpoints(sliceEntry.endpointsPool, info)
-
-
-// Picks an endpoint from the pool, which is of type `assignedEndpoints`.
-function PickFromAssignedEndpoints(pool, info):
-  if empty(pool.allEndpointsInSlice):
-    // This can be true only when the matching entry is in fallback mode
-    // (because of not having any endpoints) *and* fallback is disabled.
+def pick_from_assigned_endpoints(pool: AssignedEndpointsPool, pick_args: PickArgs) -> PickResult:
+  # This can be true only when the matching entry is in fallback mode
+  # (due to having zero endpoints) *and* fallback is disabled.
+  if not pool.endpoints:
     return PICK_FAILED
 
-  // Pick a random endpoint within the slice.
-  firstIndex = PickRandomIndex(pool.allEndpointsInSlice)
+  # Pick a random starting index within the pool.
+  first_index = random_index(pool.endpoints)
 
-  // Loop through all endpoints in the slice starting at the above random index,
-  // and delegate to the first READY endpoint. If there is no endpoint in
-  // CONNECTING state, request a connection on the first IDLE endpoint.
+  requested_connection = False
+  found_connecting     = False
 
-  requestedConnection = picker.hasEndpointInConnectingState
-  for i = 0 to len(pool.allEndpointsInSlice) - 1:
-    // Find the actual endpoint from the SliceMap.
-    index = (firstIndex + i) % len(pool.allEndpointsInSlice);
-    ep = sliceMap.allEndpoints[pool.allEndpointsInSlice[index]];
+  # Loop through all endpoints in the slice starting at first_index.
+  for i in range(len(pool.endpoints)):
+      index    = (first_index + i) % len(pool.endpoints)
+      endpoint = pool.endpoints[index]
 
-    if ep.state == READY:
-      return ep.picker.Pick(info)
-    if !requested_connection && ep.state == IDLE:
-      // This requires hopping into the WorkSerializer (C++) or
-      // SynchronizationContext (Java).
-      ep.childLB.ExitIdle()
-      requestedConnection = true
+      # If the endpoint is READY, use it (Happy Path).
+      if endpoint.state == ConnectivityState.READY:
+        return endpoint.picker.pick(pick_args)
 
-  // If we did not find any READY endpoints, but requested connection on an IDLE
-  // endpoint, queue the pick.
-  if requestedConnection:
-    // Set delay_type to "connecting".
-    return PICK_QUEUE
+      # Record whether we see a CONNECTING endpoint.
+      if endpoint.state == ConnectivityState.CONNECTING:
+        found_connecting = True
 
-  // All children are in transient failure. Return the first failure.
-  ep = sliceMap.allEndpoints[pool.allEndpointsInSlice[firstIndex]];
-  return ep.picker.Pick(info)
+      # If we see an IDLE endpoint and haven't triggered a connection yet, do so now.
+      if not requested_connection and endpoint.state == ConnectivityState.IDLE:
+        endpoint.request_connection()
+        requested_connection = True
+
+  # If no READY endpoint was found, but we either requested a connection
+  # or found a CONNECTING endpoint, queue the pick.
+  if requested_connection or found_connecting:
+      return PICK_QUEUE
+
+  # All endpoints are in TRANSIENT_FAILURE. Fail the pick by delegating to the
+  # randomly selected endpoint's picker to yield a detailed error message.
+  return pool.endpoints[first_index].picker.pick(pick_args)
 ```
 
 ### Interactions with `pick_first`
