@@ -3,7 +3,7 @@ A119: Slicer LB Policy
 * Author: easwars
 * Approver: markdroth
 * Implemented in: TBD
-* Last updated: 2026-07-27
+* Last updated: 2026-08-07
 * Discussion at: TDB
 
 ## Abstract
@@ -144,16 +144,16 @@ class PickerEndpoint:
 The LB policy must use the injected "Channel Factory" to create a gRPC channel
 to the sharding service, and must create a `Shard` stream on it. The sharding
 service will send assignments on this stream. These will be stored internally in
-a data structure named `LogicalAssignment`, and will contain key-ranges and
-their associated endpoint names. This could look something like this:
+a data structure named `Assignment`, and will contain key-ranges and their
+associated endpoint names. This could look something like this:
 
 ```python
 class Slice:
   start_key:  bytes      # Inclusive
   end_key:    bytes      # Exclusive, None for sentinel
-  endpoints:  list[int]  # Indices into LogicalAssignment.endpoint_names
+  endpoints:  list[int]  # Indices into Assignment.endpoint_names
 
-class LogicalAssignment:
+class Assignment:
   slices:         list[Slice]  # List of non-overlapping key-range slice assignments
   endpoint_names: list[str]    # Complete list of endpoint names in the assignment
   generation:     int          # Generation number of the assignment
@@ -161,13 +161,17 @@ class LogicalAssignment:
 
 #### SliceMap
 
-`EndpointMap` and `LogicalAssignment` are combined into a data structure named
-`SliceMap`, which is optimized for lookups. Given a key, it returns a matching
-key-range. The `SliceMap` must be immutable, allowing the Picker to access it
-without any explicit synchronization with the LB policy. The `SliceMap` is meant
-to be used by the `Picker` in conjunction with a list of `PickerEndpoint`s such
-that the list can be swapped out, as long as the number and order of endpoints
-don't change.
+To route each RPC, the picker will essentially need to use the `Assignment` to
+determine which `Slice` to use, choose an endpoint name from within that
+`Slice`, and then look up that endpoint name in the `EndpointMap`. For
+performance reasons, we want to avoid having to look up the endpoint name in a
+map, so we will create a new data structure called a `SliceMap` that is
+optimized for lookups. Given a key, it returns a matching key-range. The
+`SliceMap` must be immutable, allowing the Picker to access it without any
+explicit synchronization with the LB policy. The `SliceMap` is meant to be used
+by the `Picker` in conjunction with a list of `PickerEndpoint`s such that the
+list can be swapped out, as long as the number and order of endpoints don't
+change.
 
 ```python
 class SliceEntry:
@@ -187,11 +191,11 @@ of `SliceMap.lookup` boils down to a binary search to find the smallest index
 is what we are actually looking for. Here is a psuedo-code for it:
 
 ```python
-# Returns a tuple where the first value is an index into SliceMap.slices
-def lookup(self, key: bytes) -> tuple[int, SliceEntry] | tuple[None, None]:
+# Returns an index into SliceMap.slices
+def lookup(self, key: bytes) -> int | None:
   # Handle the startup/fallback case where there are no assignments.
   if not self.slices:
-    return None, None
+    return None
 
   # Binary search for key, comparing against slice_entry.start_key.
   # Returns (idx, found):
@@ -202,20 +206,19 @@ def lookup(self, key: bytes) -> tuple[int, SliceEntry] | tuple[None, None]:
 
   # Exact match on start_key.
   if found:
-      return idx, self.slices[idx]
+      return idx
 
   # Key falls in range [slices[idx - 1].start_key, slices[idx].start_key).
-  return idx - 1, self.slices[idx - 1]
+  return idx - 1
 ```
 
 #### Building the SliceMap
 
-The `SliceMap` is generated from the `EndpointMap` and `LogicalAssignment` when
-either of them change. Here is the pseudo-code for the logic to build the
-`SliceMap`:
+The `SliceMap` is generated from the `EndpointMap` and `Assignment` when either
+of them change. Here is the pseudo-code for the logic to build the `SliceMap`:
 
 ```python
-def build_slice_map(endpoint_map: EndpointMap, assignment: LogicalAssignment | None) -> SliceMap:
+def build_slice_map(endpoint_map: EndpointMap, assignment: Assignment | None) -> SliceMap:
   slice_map = SliceMap(slices=[], fallback_pool=[], generation=0)
 
   # Populate fallback_pool deterministically sorted by endpoint index.
@@ -395,6 +398,21 @@ must set the connectivity state of the gRPC channel to `TRANSIENT_FAILURE` and
 fail all subsequent RPCs until an update with a non-empty set of endpoints is
 received.
 
+### Handling updates from child policies
+
+When the LB policy receives a state update from one of its child policies,
+containing the new connectivity state and picker for the child policy, the LB
+policy must perform the following:
+
+* Update the `EndpointState` stored in the `EndpointMap` corresponding to the
+  child policy.
+* Build a new `Picker` with the existing `SliceMap` and updated `EndpointMap`.
+  * Since the order or number of endpoints did not change as part of this
+    update, the `Picker` will be able to build a new `list[PickerEndpoint]` and
+    use it with the existing `SliceMap`.
+* Compute the aggregated connectivity state of the gRPC channel.
+* Update the gRPC channel with the new connectivity state and `Picker`.
+
 ### Creating a gRPC Channel to the Sharding Service
 
 The LB policy will be injected with a “Channel Factory” via attributes,
@@ -553,7 +571,7 @@ From the LB policy’s point of view, this will look as follows:
 
 Visually, we can represent this as follows:
 
-![Logical Assignment](A119_graphics/logical_assignment.png)
+![Assignment](A119_graphics/logical_assignment.png)
 
 The LB policy must cache the `AssignmentChunk` messages locally until it sees an
 `AssignmentMetadata` message. This is because each `Chunk` contains several
@@ -581,7 +599,7 @@ The LB policy must create a new `Picker` every time a new `SliceMap` is built,
 which happens every time the LB policy receives new endpoints from the Name
 Resolver or new assignments from the sharding service. The LB policy must create
 a new `Picker` when it receives a state update from one of its child policies as
-well, but this time around, the existing `SliceMap` can be used.
+well, but in this case, the existing `SliceMap` can be reused.
 
 Here is the pseudo-code for the `Picker` method of the picker:
 
@@ -591,13 +609,11 @@ class Picker:
   endpoints:                 list[PickerEndpoint] # Ordered 1:1 by EndpointState.index
   slice_in_fallback:         list[bool]           # Precomputed per-slice in_fallback status
   fallback_pool_in_fallback: bool                 # Precomputed fallback_pool in_fallback status
-  fallback_enabled:          bool
-  slice_key_header_name:     str
+  lb_config:                 LbConfig             # A ref to the LB policy config
 
-  def __init__(self, endpoint_map: EndpointMap, slice_map: SliceMap, fallback_enabled: bool, slice_key_header_name: str):
+  def __init__(self, endpoint_map: EndpointMap, slice_map: SliceMap, lb_config: LbConfig):
     self.slice_map             = slice_map
-    self.fallback_enabled      = fallback_enabled
-    self.slice_key_header_name = slice_key_header_name
+    self.lb_config             = lb_config
  
     # Build immutable snapshot of PickerEndpoints sorted by EndpointState.index.
     self.endpoints = [
@@ -621,18 +637,20 @@ class Picker:
   def _is_pool_in_fallback(self, indices: list[int]) -> bool:
     if not indices:
       return True
-    return all(self.endpoints[i].state == ConnectivityState.TRANSIENT_FAILURE for i in indices)
+    return all(self.endpoints[i].state == TRANSIENT_FAILURE for i in indices)
 
   def pick(self, pick_args: PickArgs) -> PickResult:
     # Extract sharding key from request metadata/header
-    key = extract_key_from_metadata(pick_args, self.slice_key_header_name)
+    key = extract_key_from_metadata(pick_args, self.lb_config.slice_key_header_name)
 
     # Lookup matching slice range index and SliceEntry
     slice_idx, slice_entry = self.slice_map.lookup(key)
 
-    # No assignment covers this key (startup case)
+    # No assignment covers this key. This is only possible when the
+    # initial_assignment_timeout has expired *and* no valid assignments have
+    # been received from the sharding service.
     if slice_idx is None:
-      if self.fallback_enabled:
+      if self.lb_config.fallback_enabled:
         return self.pick_from_endpoint_indices(
           self.slice_map.fallback_pool,
           self.fallback_pool_in_fallback,
@@ -641,7 +659,7 @@ class Picker:
       return PICK_FAILED
 
     # Matching key range is in fallback mode and fallback is enabled
-    if self.slice_in_fallback[slice_idx] and self.fallback_enabled:
+    if self.slice_in_fallback[slice_idx] and self.lb_config.fallback_enabled:
       return self.pick_from_endpoint_indices(
         self.slice_map.fallback_pool,
         self.fallback_pool_in_fallback,
@@ -675,15 +693,15 @@ class Picker:
       endpoint = self.endpoints[ep_idx]
 
       # If READY, use immediately (Happy Path)
-      if endpoint.state == ConnectivityState.READY:
+      if endpoint.state == READY:
         return endpoint.picker.pick(pick_args)
 
       # Record if we see a CONNECTING endpoint
-      if endpoint.state == ConnectivityState.CONNECTING:
+      if endpoint.state == CONNECTING:
         found_connecting = True
 
       # If IDLE, trigger connection on the child LB (at most one per pick)
-      if not requested_connection and endpoint.state == ConnectivityState.IDLE:
+      if not requested_connection and endpoint.state == IDLE:
         endpoint.child_lb.exit_idle()
         requested_connection = True
 
