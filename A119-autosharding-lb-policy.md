@@ -136,7 +136,11 @@ a new data structure that contains only the fields from `EndpointState` that the
 class PickerEndpoint:
   state:    ConnectivityState
   picker:   Picker
-  child_lb: Balancer           # Child balancer to request a connection to the endpoint
+
+  # The purpose of this field is to allow the Picker to trigger a connection
+  # attempt on the child policy. Implementations are free to use a type that is
+  # most appropriate for them.
+  child_lb: ExitIdler | LoadBalancer | EndpointState
 ```
 
 #### Assignment
