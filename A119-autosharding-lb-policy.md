@@ -644,7 +644,7 @@ class Picker:
     key = extract_key_from_metadata(pick_args, self.lb_config.slice_key_header_name)
 
     # Lookup matching slice range index and SliceEntry
-    slice_idx, slice_entry = self.slice_map.lookup(key)
+    slice_idx = self.slice_map.lookup(key)
 
     # No assignment covers this key. This is only possible when the
     # initial_assignment_timeout has expired *and* no valid assignments have
@@ -669,6 +669,7 @@ class Picker:
     # Delegate to assigned endpoints for the matching key range.
     # When the matching key range is in fallback, but fallback is disabled, this
     # will yield a better error message.
+    slice_entry = self.slice_map.slices[slice_idx]
     return self.pick_from_endpoint_indices(
         slice_entry.endpoints,
         self.slice_in_fallback[slice_idx],
