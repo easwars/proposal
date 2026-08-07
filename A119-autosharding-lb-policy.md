@@ -1,4 +1,4 @@
-A119: Slicer LB Policy
+A119: Auto-Sharding LB Policy
 ----
 * Author: easwars
 * Approver: markdroth
@@ -8,9 +8,9 @@ A119: Slicer LB Policy
 
 ## Abstract
 
-Add support for a sharding load balancing policy, that communicates with an
-external sharding service to receive resource assignments. This policy should be
-supported in both xDS and non-xDS based deployments.
+Add support for an auto-sharding load balancing policy, that communicates with
+an external sharding service to receive resource assignments. This policy should
+be supported in both xDS and non-xDS based deployments.
 
 ## Background
 
@@ -57,8 +57,8 @@ has applications in various scenarios, such as:
 
 ## Proposal
 
-Add the `slicer_experimental` LB policy in gRPC that contains the following
-functionality:
+Add the `autosharding_experimental` LB policy in gRPC that contains the
+following functionality:
 
 * Utilizing the OSS DynamicSharding gRPC protocol for communicating with a
   sharding service and processing assignments from that service.
@@ -77,7 +77,7 @@ Name Resolver and not from the sharding service.
 
 ### LB Policy Architecture
 
-![LB Policy Architecture](A119_graphics/slicer_lb_policy_architecture.png)
+![LB Policy Architecture](A119_graphics/Auto-Sharding-LB-Policy-Architecture.png)
 
 The LB policy receives the following information from the Name Resolver apart
 from its configuration:
@@ -300,8 +300,8 @@ with a new `Picker`, which then retries any queued RPCs:
   * If fallback is disabled: RPCs fail until a valid assignment is received.
 
 While RPCs are queued waiting for one of the above events to happen, the
-`Picker` must set `delay_type` to "slicer_assignment_pending". See [WIP gRFC
-A121][A121].
+`Picker` must set `delay_type` to "autosharding_assignment_pending". See [WIP
+gRFC A121][A121].
 
 ### Supported modes of operation
 
@@ -317,8 +317,8 @@ The LB policy must support two primary modes of operation:
 * An LB policy that only performs endpoint picking:
   * In xDS use-cases, such an LB policy will be configured under a policy like
     `weighted_target_experimental` that handles locality picking, while each
-    `slicer_experimental` child policy instance only handles endpoint picking
-    within its specific locality.
+    `autosharding_experimental` child policy instance only handles endpoint
+    picking within its specific locality.
 
 The LB policy must maintain consistent behavior across both modes and must not
 require explicit knowledge of its operational context. Notably, we do not
@@ -328,10 +328,10 @@ and introduces significant implementation complexity.
 
 ### Load Balancing Configuration
 
-The `slicer_experimental` LB policy's configuration will be as follows:
+The `autosharding_experimental` LB policy's configuration will be as follows:
 
 ```proto
-message SlicerLbConfig {
+message AutoShardingLbConfig {
  // Key to pass to the "Channel Factory" to create a gRPC Channel to the
  // sharding service.
  string channel_factory_key = 1;
@@ -501,12 +501,12 @@ message currently contains three fields:
   * In xDS use-cases, the “Locality” value is currently populated by the
     `weighted_target_experimental` LB policy as a resolver state attribute, and
     is available to all LB policies that sit underneath it.
-    * When the `slicer_experimental` LB policy is used for endpoint picking
-      alone, it will sit underneath the `weighted_target_experimental` LB
-      policy, and therefore will have access to this resolver attribute. See
+    * When the `autosharding_experimental` LB policy is used for endpoint
+      picking alone, it will sit underneath the `weighted_target_experimental`
+      LB policy, and therefore will have access to this resolver attribute. See
       [gRFC A78][A78] for more details.
-    * When the `slicer_experimental` LB policy is used for both locality and
-      endpoint picking, the “Locality” value will not be part of the slicing
+    * When the `autosharding_experimental` LB policy is used for both locality
+      and endpoint picking, the “Locality” value will not be part of the slicing
       target as the policy will handle endpoints from all localities.
   * In non-xDS use-cases, the common case is for the `slicing_target` to not
     contain `%s` tokens. But if they do, it is the responsibility of the user to
@@ -571,7 +571,7 @@ From the LB policy’s point of view, this will look as follows:
 
 Visually, we can represent this as follows:
 
-![Assignment](A119_graphics/logical_assignment.png)
+![Assignment](A119_graphics/Assignment.png)
 
 The LB policy must cache the `AssignmentChunk` messages locally until it sees an
 `AssignmentMetadata` message. This is because each `Chunk` contains several
@@ -720,15 +720,15 @@ class Picker:
 
 The LB policy will not proactively connect to endpoints given to it by the Name
 Resolver. Instead, connections are triggerred from the picker as described above
-in the picker pseudo-code. `slicer_experimental` must create a `pick_first`
-child for every endpoint given to it by the Name Resolver. `pick_first` starts
-connecting as soon as it is given its endpoint. So, `slicer_experimental` must
-make sure that the child `pick_first` policy is created lazily, when a
-connection to that endpoint needs to be established. This may be accomplished by
-wrapping `pick_first` in a parent policy that creates `pick_first` only when
-asked to establish a connection.
+in the picker pseudo-code. `autosharding_experimental` must create a
+`pick_first` child for every endpoint given to it by the Name Resolver.
+`pick_first` starts connecting as soon as it is given its endpoint. So,
+`autosharding_experimental` must make sure that the child `pick_first` policy is
+created lazily, when a connection to that endpoint needs to be established. This
+may be accomplished by wrapping `pick_first` in a parent policy that creates
+`pick_first` only when asked to establish a connection.
 
-The `slicer_experimental` LB policy also relies on the sticky-TF behavior
+The `autosharding_experimental` LB policy also relies on the sticky-TF behavior
 (specified in [gRFC A62][A62]) implemented by the `pick_first` policy, that
 ensures endpoints in `TRANSIENT_FAILURE` stay in that state and continuously try
 to reconnect with exponential backoff until they become `READY`.
@@ -790,7 +790,7 @@ if aggregated_state in (CONNECTING, TRANSIENT_FAILURE):
 
 ### xDS integration
 
-In order to use the `slicer_experimental` policy in xDS use-cases, we will
+In order to use the `autosharding_experimental` policy in xDS use-cases, we will
 define a protobuf message that represents the configuration for this policy in
 the Envoy xDS repo. The xDS management server will then make use of the
 [load_balancing_policy](https://github.com/envoyproxy/envoy/blob/d26361ac44e48ad347afbaff141c5c0387d48c40/api/envoy/config/cluster/v3/cluster.proto#L1229)
@@ -800,26 +800,27 @@ resource appropriately.
 
 As mentioned in the [Supported modes of
 operation](#supported-modes-of-operation) section, client applications can be
-configured to use the `slicer_experimental` LB policy for both locality and
-endpoint picking, by setting the `load_balancing_policy` field to an instance of
-the `Slicer` protobuf message described in the next section. To use the
-`slicer_experimental` LB policy *only* for endpoint picking, the
-`load_balancing_policy` field could be set to a locality picking policy like
+configured to use the `autosharding_experimental` LB policy for both locality
+and endpoint picking, by setting the `load_balancing_policy` field to an
+instance of the `AutoSharding` protobuf message described in the next section.
+To use the `autosharding_experimental` LB policy *only* for endpoint picking,
+the `load_balancing_policy` field could be set to a locality picking policy like
 [WrrLocality](https://github.com/envoyproxy/envoy/blob/d26361ac44e48ad347afbaff141c5c0387d48c40/api/envoy/extensions/load_balancing_policies/wrr_locality/v3/wrr_locality.proto#L21)
-and setting the `endpoint_picking_policy` field inside it to the `Slicer`
+and setting the `endpoint_picking_policy` field inside it to the `AutoSharding`
 protobuf message described below.
 
 #### xDS LB policy configuration
 
 A new message type that represents the configuration for the
-`slicer_experimental` LB policy will be added to the envoy repository in the
+`autosharding_experimental` LB policy will be added to the envoy repository in
+the
 [api/envoy/extensions/load_balancing_policies](https://github.com/envoyproxy/envoy/tree/main/api/envoy/extensions/load_balancing_policies)
 directory.
 
 ```proto
 import "envoy/config/core/v3/grpc_service.proto";
 
-message Slicer {
+message AutoSharding {
  // Configuration for the gRPC service that the LB policy will communicate with
  // to receive sharding assignments from.
  config.core.v3.GrpcService grpc_service = 1;
@@ -912,9 +913,10 @@ We need a map of GrpcServices to be passed from the xDS LB Registry to the
   could have more than one LB policy that wishes to communicate with the same
   external server, but use different credentials.
 
-The converter for the `Slicer` xDS LB policy must set the `channel_factory_key`
-field of the `slicer_experimental` LB policy to contain the same value that is
-used as the map key in the returned map of GrpcServices.
+The converter for the `AutoSharding` xDS LB policy must set the
+`channel_factory_key` field of the `autosharding_experimental` LB policy to
+contain the same value that is used as the map key in the returned map of
+GrpcServices.
 
 #### Child policy config generation
 
@@ -951,7 +953,7 @@ specific cluster. This includes generating configuration for the locality and
 endpoint picking policies based on the configuration specified in the
 `ClusterUpdate` struct.
 
-To support `slicer_experimental` LB policy, on every update from the Name
+To support `autosharding_experimental` LB policy, on every update from the Name
 Resolver, the `cds_experimental` LB policy must check if the `LBPolicyInfo`
 field has changed.  If the `LBPolicyInfo` contains an updated map of
 GrpcServices, it must create a new "Channel Factory" that is capable of creating
@@ -966,7 +968,7 @@ above mentioned steps for aggregate clusters.
 
 During initial development, this feature will be enabled via the
 `GRPC_XDS_EXPERIMENTAL_ENABLE_SLICER_LB` environment variable, that will guard
-the registration of the `Slicer` LB policy in the xDS LB Registry.  This
+the registration of the `AutoSharding` LB policy in the xDS LB Registry.  This
 environment variable protection will be removed once the feature has proven
 stable.
 
@@ -988,14 +990,15 @@ key-range. But this comes with the following problems:
 
 Picking a random endpoint from a matching key-range solves all known existing
 use-cases. If we need to support something other than this, we *could* consider
-building the logic for such an LB policy inside of the `slicer_experimental` LB
-policy, instead of creating a child policy for it.
+building the logic for such an LB policy inside of the
+`autosharding_experimental` LB policy, instead of creating a child policy for
+it.
 
 ### Locality-picking policy alone
 
 Since we decided to not support child policies per key-range, supporting the
-`slicer_experimental` LB policy as a locality picking policy that would use a
-different endpoint picking policy goes out of the window.
+`autosharding_experimental` LB policy as a locality picking policy that would
+use a different endpoint picking policy goes out of the window.
 
 Supporting such a configuration would add a lot of complexity without any
 identified use-case requiring it.
