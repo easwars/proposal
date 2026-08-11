@@ -972,9 +972,9 @@ above mentioned steps for aggregate clusters.
 ### Temporary environment variable protection
 
 During initial development, this feature will be enabled via the
-`GRPC_XDS_EXPERIMENTAL_ENABLE_SLICER_LB` environment variable, that will guard
-the registration of the `AutoSharding` LB policy in the xDS LB Registry.  This
-environment variable protection will be removed once the feature has proven
+`GRPC_XDS_EXPERIMENTAL_ENABLE_AUTOSHARDING_LB` environment variable, that will
+guard the registration of the `AutoSharding` LB policy in the xDS LB Registry.
+This environment variable protection will be removed once the feature has proven
 stable.
 
 ## Rationale
