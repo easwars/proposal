@@ -106,6 +106,13 @@ class EndpointState:
   state:    ConnectivityState  # Most recent connectivity state of the endpoint
   picker:   Picker             # Most recent picker returned by the child balancer
 
+  # Called to request a connection.
+  # Lazily creates the LB policy as needed.
+  def RequestConnection(self):
+    if self.child_lb is None:
+      # ...create child policy...
+    self.child_lb.ExitIdle()
+
 # Map from endpoint hostname to endpoiont state
 class EndpointMap:
   m: dict[str, EndpointState]
@@ -138,9 +145,11 @@ class PickerEndpoint:
   picker:   Picker
 
   # The purpose of this field is to allow the Picker to trigger a connection
-  # attempt on the child policy. Implementations are free to use a type that is
+  # attempt on the child policy. If the child LB policy instance does not yet
+  # exist, the implementation MUST lazily create it before triggering the
+  # connection attempt. Implementations are free to use a type that is
   # most appropriate for them.
-  child_lb: ExitIdler | LoadBalancer | EndpointState
+  endpoint: ExitIdler | EndpointState
 ```
 
 #### Assignment
@@ -624,7 +633,7 @@ class Picker:
         PickerEndpoint(
             state    = es.state,
             picker   = es.picker,
-            child_lb = es.child_lb
+            endpoint = es
         )
         for es in sorted(endpoint_map.m.values(), key=lambda es: es.index)
     ]
@@ -707,7 +716,7 @@ class Picker:
 
       # If IDLE, trigger connection on the child LB (at most one per pick)
       if not requested_connection and endpoint.state == IDLE:
-        endpoint.child_lb.exit_idle()
+        endpoint.RequestConnection()
         requested_connection = True
 
     # If no READY endpoint was found, but we requested a connection or found a
