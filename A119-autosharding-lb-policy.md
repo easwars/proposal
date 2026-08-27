@@ -3,7 +3,7 @@ A119: Auto-Sharding LB Policy
 * Author: easwars
 * Approver: markdroth
 * Implemented in: TBD
-* Last updated: 2026-08-07
+* Last updated: 2026-08-27
 * Discussion at: TDB
 
 ## Abstract
