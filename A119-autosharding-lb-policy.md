@@ -53,15 +53,14 @@ has applications in various scenarios, such as:
 * [A81: xDS Authority Rewriting][A81]
 * [A102: xDS GrpcService Support][A102]
 * [A121: RPC Delay Observability][A121]
-* [OSS DynamicSharding gRPC Protocol Spec](TBD)
 
 ## Proposal
 
 Add the `autosharding_experimental` LB policy in gRPC that contains the
 following functionality:
 
-* Utilizing the OSS DynamicSharding gRPC protocol for communicating with a
-  sharding service and processing assignments from that service.
+* Utilizing the [OSS Autosharding gRPC protocol][Autosharding] for communicating
+  with a sharding service and processing assignments from that service.
   * These assignments will partition an application-defined keyspace into
     distinct, non-overlapping key-ranges or slices, each associated with a set
     of server endpoints.
@@ -155,10 +154,11 @@ class PickerEndpoint:
 #### Assignment
 
 The LB policy must use the injected "Channel Factory" to create a gRPC channel
-to the sharding service, and must create a `Shard` stream on it. The sharding
-service will send assignments on this stream. These will be stored internally in
-a data structure named `Assignment`, and will contain key-ranges and their
-associated endpoint names. This could look something like this:
+to the sharding service, and must create a `WatchShardingAssignment` stream on
+it. The sharding service will send assignments on this stream. These will be
+stored internally in a data structure named `Assignment`, and will contain
+key-ranges and their associated endpoint names. This could look something like
+this:
 
 ```python
 class Slice:
@@ -344,7 +344,7 @@ and introduces significant implementation complexity.
 The `autosharding_experimental` LB policy's configuration will be as follows:
 
 ```proto
-message AutoShardingLbConfig {
+message AutoshardingLbConfig {
  // Key to pass to the "Channel Factory" to create a gRPC Channel to the
  // sharding service.
  string channel_factory_key = 1;
@@ -388,12 +388,15 @@ When the LB policy receives a configuration update, it must do the following:
 
 * If the `channel_factory_key` field has changed (or if this is the
   first configuration update), use the “Channel Factory” to [create a new gRPC
-  channel to this target URI](#creating-a-grpc-channel-to-the-sharding-service).
-  If a new gRPC channel is created:
-  * Create a new `Shard` stream on the newly created gRPC channel, and,
+  channel to this target
+  URI](#creating-a-grpc-channel-to-the-autosharding-service). If a new gRPC
+  channel is created:
+  * Create a new `WatchShardingAssignment` stream on the newly created gRPC
+    channel, and,
   * Close the previously created gRPC channel to the sharding service
-* If the `slicing_target` field has changed, create a new `Shard` stream because
-  the `slicing_target` controls the assignments sent by the sharding service.
+* If the `autosharding_target` field has changed, create a new
+  `WatchShardingAssignment` stream because the `autosharding_target` controls
+  the assignments sent by the sharding service.
 
 When the LB policy receives endpoints from the Name Resolver, it must do the
 following:
@@ -426,7 +429,7 @@ policy must perform the following:
 * Compute the aggregated connectivity state of the gRPC channel.
 * Update the gRPC channel with the new connectivity state and `Picker`.
 
-### Creating a gRPC Channel to the Sharding Service
+### Creating a gRPC Channel to the Autosharding Service
 
 The LB policy will be injected with a “Channel Factory” via attributes,
 alongside its configuration. This utility will help create a fully functional
@@ -494,23 +497,24 @@ TBD
 
 TBD
 
-### Communicating with the sharding service
+### Communicating with the Autosharding service
 
-The LB policy communicates with an external sharding service using the OSS
-DynamicSharding gRPC protocol. As described earlier, the LB policy creates a
-gRPC channel to the sharding service using the “Channel Factory” provided to it,
-whenever the `channel_factory_key` in its configuration changes. It will
-then create a `Shard` stream on that channel.
+The LB policy communicates with an external sharding service using the [OSS
+Autosharding gRPC][Autosharding] protocol. As described earlier, the LB policy
+creates a gRPC channel to the sharding service using the “Channel Factory”
+provided to it, whenever the `channel_factory_key` in its configuration changes.
+It will then create a `WatchShardingAssignment` stream on that channel.
 
 #### Sending the first message
 
-The LB policy sends an `Init` message on the stream to kick things off. This
-message currently contains three fields:
+The LB policy sends an `InitialClientConfig` message on the stream to kick
+things off. This message currently contains three fields:
 
-* `target`: The value for this field is derived from the `slicing_target` field
-  of the LB policy configuration. If a `%s` tokens is present in this string, it
-  is replaced with the “Locality” value  passed to the LB policy as attributes
-  in the resolver update (similar to how the “Channel Factory” is passed).
+* `target`: The value for this field is derived from the `autosharding_target`
+  field of the LB policy configuration. If a `%s` tokens is present in this
+  string, it is replaced with the “Locality” value  passed to the LB policy as
+  attributes in the resolver update (similar to how the “Channel Factory” is
+  passed).
   * In xDS use-cases, the “Locality” value is currently populated by the
     `weighted_target_experimental` LB policy as a resolver state attribute, and
     is available to all LB policies that sit underneath it.
@@ -519,25 +523,26 @@ message currently contains three fields:
       LB policy, and therefore will have access to this resolver attribute. See
       [gRFC A78][A78] for more details.
     * When the `autosharding_experimental` LB policy is used for both locality
-      and endpoint picking, the “Locality” value will not be part of the slicing
-      target as the policy will handle endpoints from all localities.
-  * In non-xDS use-cases, the common case is for the `slicing_target` to not
-    contain `%s` tokens. But if they do, it is the responsibility of the user to
-    ensure that this attribute is populated by the Name Resolver. If this
-    attribute is not available, the LB policy will replace the `%s` token with
-    an empty string.
+      and endpoint picking, the “Locality” value will not be part of the
+      `autosharding_target` field of the LB policy configuration, as the policy
+      will handle endpoints from all localities.
+  * In non-xDS use-cases, the common case is for the `autosharding_target` to
+    not contain `%s` tokens. But if they do, it is the responsibility of the
+    user to ensure that this attribute is populated by the Name Resolver. If
+    this attribute is not available, the LB policy will replace the `%s` token
+    with an empty string.
 * `client_uuid`: The LB policy generates a UUID at creation time and must reuse
   the same value across stream restarts.
-* `current_generation`: The LB policy must store the generation number of the
+* `latest_generation`: The LB policy must store the generation number of the
   most recent good assignment received from the sharding service and use that
   value here.
   * This allows the sharding service to not resend a previously sent good
     assignment in the case of a stream failure.
 
-#### Handling responses from the sharding server
+#### Handling responses from the Autosharding server
 
-Responses received from the sharding server in a `ShardingResponse` message can
-one of the following:
+Responses received from the sharding server in a
+`WatchShardingAssignmentResponse` message can one of the following:
 
 * `AssignmentChunk`: This contains one chunk of a logical assignment from the
   sharding server. The LB policy must cache chunks until it receives an
@@ -550,33 +555,36 @@ one of the following:
   message for the time being.
 
 See section on [Handling assignments from the sharding
-server](#handling-assignments-from-the-sharding-server) for more information.
+server](#handling-assignments-from-the-autosharding-server) for more
+information.
 
 #### Backoff on stream and connectivity failures
 
-When a `Shard` stream fails without receiving at least one good logical
-assignment, the LB policy must use exponential backoff before each successive
-attempt to re-establish the stream. The algorithm should be similar to what gRPC
-uses for connection attempts. The backoff state will be reset when a `Shard`
-stream finally receives a good logical assignment from the server.
-Implementations should use the `wait_for_ready` option on the `Shard` stream to
-help recover faster from connectivity failures instead of applying a backoff
-when stream creation fails.
+When a `WatchShardingAssignment` stream fails without receiving at least one
+good logical assignment, the LB policy must use exponential backoff before each
+successive attempt to re-establish the stream. The algorithm should be similar
+to what gRPC uses for connection attempts. The backoff state will be reset when
+a `WatchShardingAssignment` stream finally receives a good logical assignment
+from the server.  Implementations should use the `wait_for_ready` option on the
+`WatchShardingAssignment` stream to help recover faster from connectivity
+failures instead of applying a backoff when stream creation fails.
 
-#### Handling assignments from the sharding server
+#### Handling assignments from the Autosharding server
 
-The sharding server implementing the OSS DynamicSharding gRPC protocol will
-distribute (chunked) complete assignments to its clients, instead of deltas.
-From the LB policy’s point of view, this will look as follows:
+The autosharding server implementing the [OSS Autosharding gRPC][Autosharding]
+protocol will distribute (chunked) complete assignments to its clients, instead
+of deltas.  From the LB policy’s point of view, this will look as follows:
 
-* A single logical assignment is split into multiple `ShardingResponse` messages
-* Each `ShardingResponse` message contains either an `AssignmentChunk` message
-  or an `AssignmentMetadata` message.
+* A single logical assignment is split into multiple
+  `WatchShardingAssignmentResponse` messages
+* Each `WatchShardingAssignmentResponse` message contains either an
+  `AssignmentChunk` message or an `AssignmentMetadata` message.
 * Each `AssignmentChunk` message contains a list of `SliceAssignment` messages
   and a list of `EndpointState` messages:
   * Each `SliceAssignment` message contains a `Slice` that contains a
-    `[start_key, end_key)` and a list of endpoint indices into the combined
-    endpoint list over all chunks (in chunk order).
+    `[start_key, end_key)` and a list of `PerSliceEndpointState` messages each
+    containing an endpoint index into the combined endpoint list over all chunks
+    (in chunk order).
   * Each `EndpointState` message contains a single endpoint name.
 * The `AssignmentMetadata` message indicates that the sharding server has
   completed sending all chunks for the current assignment and contains a
@@ -595,16 +603,31 @@ are received, the LB policy cannot meaningfully use any of them.
 Once the `AssignmentMetadata` message is received, the LB policy must validate
 the assignment as follows:
 
-* Ensure that there are no gaps in the key-ranges represented by the `Slice`s.
 * Ensure all endpoint indices specified in the `Slice`s are valid once the
   endpoint names are combined.
+* Ensure that there are no overlapping key-ranges represented by the `Slice`s.
+* Ensure that the `start_key` is not greater than the `end_key`.
 
-If validation fails, the LB policy must terminate the stream to the sharding
-service, and attempt to re-establish it.
+If validation fails, the LB policy must continue using any previously received
+good assignment and send an `AssignmentAck` message with the following contents:
 
-Upon successful validation, the LB policy must build a new `SliceMap` and create
-a new picker with the newly built `SliceMap` and send an update to the gRPC
-channel.
+* `generation` field set to the `generation` field in the `AssignmentMetadata`
+* `accepted` field set to `false`
+* `error_message` field set to a description of the validation failure
+
+Note that gaps in the key-ranges represented by the `Slice`s are allowed. In
+this case, the LB policy must fill these gaps with `Slice`s that contain no
+endpoints. This will cause requests that match these `Slice`s to fallback (if
+enabled) or fail.
+
+If validation passes, the LB policy must send an `AssignmentAck` message with the
+following contents:
+
+* `generation` field set to the `generation` field in the `AssignmentMetadata`
+* `accepted` field set to `true`
+
+and then build a new `SliceMap` and create a new picker with the newly built
+`SliceMap` and send an update to the gRPC channel.
 
 ### The Picker
 
@@ -654,7 +677,7 @@ class Picker:
 
   def pick(self, pick_args: PickArgs) -> PickResult:
     # Extract sharding key from request metadata/header
-    key = extract_key_from_metadata(pick_args, self.lb_config.slice_key_header_name)
+    key = extract_key_from_metadata(pick_args, self.lb_config.key_header_name)
 
     # Lookup matching slice range index and SliceEntry
     slice_idx = self.slice_map.lookup(key)
@@ -663,7 +686,7 @@ class Picker:
     # initial_assignment_timeout has expired *and* no valid assignments have
     # been received from the sharding service.
     if slice_idx is None:
-      if self.lb_config.fallback_enabled:
+      if self.lb_config.enable_fallback:
         return self.pick_from_endpoint_indices(
           self.slice_map.fallback_pool,
           self.fallback_pool_in_fallback,
@@ -672,7 +695,7 @@ class Picker:
       return PICK_FAILED
 
     # Matching key range is in fallback mode and fallback is enabled
-    if self.slice_in_fallback[slice_idx] and self.lb_config.fallback_enabled:
+    if self.slice_in_fallback[slice_idx] and self.lb_config.enable_fallback:
       return self.pick_from_endpoint_indices(
         self.slice_map.fallback_pool,
         self.fallback_pool_in_fallback,
@@ -816,11 +839,11 @@ As mentioned in the [Supported modes of
 operation](#supported-modes-of-operation) section, client applications can be
 configured to use the `autosharding_experimental` LB policy for both locality
 and endpoint picking, by setting the `load_balancing_policy` field to an
-instance of the `AutoSharding` protobuf message described in the next section.
+instance of the `Autosharding` protobuf message described in the next section.
 To use the `autosharding_experimental` LB policy *only* for endpoint picking,
 the `load_balancing_policy` field could be set to a locality picking policy like
 [WrrLocality](https://github.com/envoyproxy/envoy/blob/d26361ac44e48ad347afbaff141c5c0387d48c40/api/envoy/extensions/load_balancing_policies/wrr_locality/v3/wrr_locality.proto#L21)
-and setting the `endpoint_picking_policy` field inside it to the `AutoSharding`
+and setting the `endpoint_picking_policy` field inside it to the `Autosharding`
 protobuf message described below.
 
 #### xDS LB policy configuration
@@ -834,7 +857,7 @@ directory.
 ```proto
 import "envoy/config/core/v3/grpc_service.proto";
 
-message AutoSharding {
+message Autosharding {
  // Configuration for the gRPC service that the LB policy will communicate with
  // to receive sharding assignments from.
  config.core.v3.GrpcService grpc_service = 1;
@@ -927,7 +950,7 @@ We need a map of GrpcServices to be passed from the xDS LB Registry to the
   could have more than one LB policy that wishes to communicate with the same
   external server, but use different credentials.
 
-The converter for the `AutoSharding` xDS LB policy must set the
+The converter for the `Autosharding` xDS LB policy must set the
 `channel_factory_key` field of the `autosharding_experimental` LB policy to
 contain the same value that is used as the map key in the returned map of
 GrpcServices.
@@ -982,7 +1005,7 @@ above mentioned steps for aggregate clusters.
 
 During initial development, this feature will be enabled via the
 `GRPC_XDS_EXPERIMENTAL_ENABLE_AUTOSHARDING_LB` environment variable, that will
-guard the registration of the `AutoSharding` LB policy in the xDS LB Registry.
+guard the registration of the `Autosharding` LB policy in the xDS LB Registry.
 This environment variable protection will be removed once the feature has proven
 stable.
 
@@ -1077,3 +1100,4 @@ TBD
 [A81]: A81-xds-authority-rewriting.md
 [A102]: <https://github.com/grpc/proposal/pull/510>
 [A121]: <https://github.com/grpc/proposal/pull/556>
+[Autosharding]: <https://github.com/GoogleCloudPlatform/autosharding/blob/main/proto/autosharding/v1/autosharding.proto>
