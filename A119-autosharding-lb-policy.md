@@ -117,8 +117,9 @@ class EndpointMap:
   m: dict[str, EndpointState]
 ```
 
-The LB policy must create a new `EndpointMap` whenever it receives new endpoints
-from the Name Resolver.
+The LB policy must create a new `EndpointMap` whenever it receives endpoints
+from the Name Resolver. If multiple endpoints share the same hostname,
+implementations may arbitrarily pick one and drop the others.
 
 ```python
 def build_endpoint_map(resolved_endpoints: list[Endpoint]) -> EndpointMap:
