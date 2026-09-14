@@ -395,12 +395,12 @@ When the LB policy receives a configuration update, it must do the following:
   channel to this target
   URI](#creating-a-grpc-channel-to-the-autosharding-service). If a new gRPC
   channel is created:
-  * Create a new `WatchShardingAssignment` stream on the newly created gRPC
-    channel, and,
+  * Pass it to the existing `AutoshardingClient` or create a new one, and,
   * Close the previously created gRPC channel to the sharding service
-* If the `autosharding_target` field has changed, create a new
-  `WatchShardingAssignment` stream because the `autosharding_target` controls
-  the assignments sent by the sharding service.
+* If the `autosharding_target` field has changed, pass it to the
+  `AutoshardingClient` which will create a new `WatchShardingAssignment` stream
+  because the `autosharding_target` controls the assignments sent by the
+  sharding service.
 
 When the LB policy receives endpoints from the Name Resolver, it must do the
 following:
@@ -507,11 +507,22 @@ The LB policy communicates with an external sharding service using the [OSS
 Autosharding gRPC][Autosharding] protocol. Implementations are encouraged to
 encapsulate all aspects of this communication like managing the stream
 lifecycle, parsing received messages and validating the assignments inside a
-dedicated component named the `AutoshardingClient`. Whenever the
-`channel_factory_key` in the configuration changes, the LB policy creates a gRPC
-channel to the sharding service using the “Channel Factory” provided to it. The
-`AutoshardingClient` will then establish a `WatchShardingAssignment` stream on
-that channel.
+dedicated component named the `AutoshardingClient`.
+
+* Whenever the `channel_factory_key` changes, the LB policy must create a new
+  gRPC channel to the sharding service using the “Channel Factory” provided to
+  it and must pass it to the `AutoshardingClient`.
+* Whenever the `autosharding_target` changes, the LB policy must pass the new
+  value to the `AutoshardingClient`.
+
+In both cases, the `AutoshardingClient` must create a new stream and throw away
+any previously received generation number. When the `channel_factory_key`
+changes, the `AutoshardingClient` might be talking to a completely new sharding
+server and when the `autosharding_target` changes, the `AutoshardingClient` is
+requesting assignments for a completely different resource. In both these cases,
+any previously stored generation number is no longer valid. Continuing to use
+them may cause the `AutoshardingClient` to not accept updates from the sharding
+server for a long time.
 
 #### Sending the first message
 
@@ -611,7 +622,12 @@ chunks are received, the `AutoshardingClient` cannot meaningfully use any of
 them.
 
 Once the `AssignmentMetadata` message is received, the `AutoshardingClient` must
-validate the assignment as follows:
+verify that the generation number in the message is strictly greater than any
+previously received generation number. If not, the assignment must be dropped
+without any further action.
+
+If the generation number is valid, the `AutoshardingClient` must validate the
+assignment as follows:
 
 * Ensure all endpoint indices specified in the `Slice`s are valid once the
   endpoint names are combined.
