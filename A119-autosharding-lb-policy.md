@@ -653,7 +653,7 @@ message with the following contents:
 * `accepted` field set to `true`
 
 and then construct a complete, gap-filled, and sorted `Assignment` as described
-in the [Contract of the AutoshardingClient](#contract-of-the-assignmentprovider)
+in the [Contract of the AutoshardingClient](#contract-of-the-autoshardingclient)
 section below, and pass it to the LB policy which will then build a new
 `SliceMap` and create new picker with the newly built `SliceMap` and send an
 update to the gRPC channel.
@@ -692,7 +692,6 @@ class Picker:
   slice_map:                 SliceMap
   endpoints:                 list[PickerEndpoint] # Ordered 1:1 by EndpointState.index
   slice_in_fallback:         list[bool]           # Precomputed per-slice in_fallback status
-  fallback_pool_in_fallback: bool                 # Precomputed fallback_pool in_fallback status
   lb_config:                 LbConfig             # A ref to the LB policy config
 
   def __init__(self, endpoint_map: EndpointMap, slice_map: SliceMap, lb_config: LbConfig):
@@ -709,12 +708,11 @@ class Picker:
         for es in sorted(endpoint_map.m.values(), key=lambda es: es.index)
     ]
  
-    # Precompute in_fallback status for each slice and the fallback_pool.
+    # Precompute in_fallback status for each slice.
     self.slice_in_fallback = [
         self._is_pool_in_fallback(se.endpoints)
         for se in slice_map.slices
     ]
-    self.fallback_pool_in_fallback = self._is_pool_in_fallback(slice_map.fallback_pool)
 
   # A pool is in fallback if it contains zero valid endpoints or if all assigned
   # endpoints are in TRANSIENT_FAILURE.
@@ -726,6 +724,8 @@ class Picker:
   def pick(self, pick_args: PickArgs) -> PickResult:
     # Extract sharding key from request metadata/header
     key = extract_key_from_metadata(pick_args, self.lb_config.key_header_name)
+    if key is None:
+      return PICK_FAILED
 
     # Lookup matching slice range index and SliceEntry
     slice_idx = self.slice_map.lookup(key)
@@ -735,32 +735,20 @@ class Picker:
     # been received from the sharding service.
     if slice_idx is None:
       if self.lb_config.enable_fallback:
-        return self.pick_from_endpoint_indices(
-          self.slice_map.fallback_pool,
-          self.fallback_pool_in_fallback,
-          pick_args
-        )
+        return self.pick_from_endpoint_indices(self.slice_map.fallback_pool, pick_args)
       return PICK_FAILED
 
     # Matching key range is in fallback mode and fallback is enabled
     if self.slice_in_fallback[slice_idx] and self.lb_config.enable_fallback:
-      return self.pick_from_endpoint_indices(
-        self.slice_map.fallback_pool,
-        self.fallback_pool_in_fallback,
-        pick_args
-      )
+      return self.pick_from_endpoint_indices(self.slice_map.fallback_pool, pick_args)
 
     # Delegate to assigned endpoints for the matching key range.
     # When the matching key range is in fallback, but fallback is disabled, this
     # will yield a better error message.
     slice_entry = self.slice_map.slices[slice_idx]
-    return self.pick_from_endpoint_indices(
-        slice_entry.endpoints,
-        self.slice_in_fallback[slice_idx],
-        pick_args
-    )
+    return self.pick_from_endpoint_indices(slice_entry.endpoints, pick_args)
 
-  def pick_from_endpoint_indices(self, indices: list[int], in_fallback: bool, pick_args: PickArgs) -> PickResult:
+  def pick_from_endpoint_indices(self, indices: list[int], pick_args: PickArgs) -> PickResult:
     # This can be true only when the matching entry is in fallback mode
     # (due to having zero endpoints) *and* fallback is disabled.
     if not indices:
