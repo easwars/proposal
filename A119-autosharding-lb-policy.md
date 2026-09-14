@@ -154,11 +154,11 @@ class PickerEndpoint:
 #### Assignment
 
 The LB policy relies on an internal helper component, which we will refer to as
-the `AssignmentProvider`, to produce a validated and gap-free set of key-ranges
+the `AutoshardingClient`, to produce a validated and gap-free set of key-ranges
 and their associated endpoints in a data structure named `Assignment`.
 
 The LB policy must use the injected "Channel Factory" to create a gRPC channel
-to the sharding service, and must pass it to the `AssignmentProvider`, which
+to the sharding service, and must pass it to the `AutoshardingClient`, which
 will use it to create a `WatchShardingAssignment` stream to receive assignments
 from the sharding service. The `Assignment` data structure could look something
 like this:
@@ -506,10 +506,10 @@ The LB policy communicates with an external sharding service using the [OSS
 Autosharding gRPC][Autosharding] protocol. Implementations are encouraged to
 encapsulate all aspects of this communication like managing the stream
 lifecycle, parsing received messages and validating the assignments inside a
-dedicated component named the `AssignmentProvider`. Whenever the
+dedicated component named the `AutoshardingClient`. Whenever the
 `channel_factory_key` in the configuration changes, the LB policy creates a gRPC
 channel to the sharding service using the “Channel Factory” provided to it. The
-`AssignmentProvider` will then establish a `WatchShardingAssignment` stream on
+`AutoshardingClient` will then establish a `WatchShardingAssignment` stream on
 that channel.
 
 #### Sending the first message
@@ -580,7 +580,7 @@ failures instead of applying a backoff when stream creation fails.
 
 The autosharding server implementing the [OSS Autosharding gRPC][Autosharding]
 protocol will distribute (chunked) complete assignments to its clients, instead
-of deltas. From the `AssignmentProvider`’s point of view, this will look as
+of deltas. From the `AutoshardingClient`’s point of view, this will look as
 follows:
 
 * A single logical assignment is split into multiple
@@ -602,14 +602,14 @@ Visually, we can represent this as follows:
 
 ![Assignment](A119_graphics/Assignment.png)
 
-The `AssignmentProvider` must cache the `AssignmentChunk` messages locally until
+The `AutoshardingClient` must cache the `AssignmentChunk` messages locally until
 it sees an `AssignmentMetadata` message. This is because each `Chunk` contains
 several endpoint names and each `Slice` within a chunk contains an index into
 the complete set of endpoint names, combined in chunk order. So, until all
-chunks are received, the `AssignmentProvider` cannot meaningfully use any of
+chunks are received, the `AutoshardingClient` cannot meaningfully use any of
 them.
 
-Once the `AssignmentMetadata` message is received, the `AssignmentProvider` must
+Once the `AssignmentMetadata` message is received, the `AutoshardingClient` must
 validate the assignment as follows:
 
 * Ensure all endpoint indices specified in the `Slice`s are valid once the
@@ -617,7 +617,7 @@ validate the assignment as follows:
 * Ensure that there are no overlapping key-ranges represented by the `Slice`s.
 * Ensure that the `start_key` is not greater than the `end_key`.
 
-If validation fails, the `AssignmentProvider` must not send an update to the LB
+If validation fails, the `AutoshardingClient` must not send an update to the LB
 policy and must send an `AssignmentAck` message with the following contents:
 
 * `generation` field set to the `generation` field in the `AssignmentMetadata`
@@ -625,27 +625,27 @@ policy and must send an `AssignmentAck` message with the following contents:
 * `error_message` field set to a description of the validation failure
 
 Note that gaps in the key-ranges represented by the `Slice`s are allowed. In
-this case, the `AssignmentProvider` must fill these gaps with `Slice`s that
+this case, the `AutoshardingClient` must fill these gaps with `Slice`s that
 contain no endpoints. This will cause requests that match these `Slice`s to
 fallback (if enabled) or fail.
 
-If validation passes, the `AssignmentProvider` must send an `AssignmentAck`
+If validation passes, the `AutoshardingClient` must send an `AssignmentAck`
 message with the following contents:
 
 * `generation` field set to the `generation` field in the `AssignmentMetadata`
 * `accepted` field set to `true`
 
 and then construct a complete, gap-filled, and sorted `Assignment` as described
-in the [Contract of the AssignmentProvider](#contract-of-the-assignmentprovider)
+in the [Contract of the AutoshardingClient](#contract-of-the-assignmentprovider)
 section below, and pass it to the LB policy which will then build a new
 `SliceMap` and create new picker with the newly built `SliceMap` and send an
 update to the gRPC channel.
 
-#### Contract of the AssignmentProvider
+#### Contract of the AutoshardingClient
 
 To ensure that the LB policy's implementation to build a `SliceMap` can remain
 simple and the picker's binary search on the `SliceMap` remains fast and
-correct, the `AssignmentProvider` must produce an `Assignment` that conforms to
+correct, the `AutoshardingClient` must produce an `Assignment` that conforms to
 the following rules:
 
 1. The list of `Slice`s must cover the entire possible keyspace, starting from
@@ -657,7 +657,7 @@ the following rules:
    index `i` from `0` to `N - 2`, `slices[i].end_key` must exactly equal
    `slices[i + 1].start_key`.
 4. Any gaps in the key-ranges returned by the autosharding server must be
-   explicitly filled by the `AssignmentProvider` as a `Slice` entry with an
+   explicitly filled by the `AutoshardingClient` as a `Slice` entry with an
    empty `endpoints` list (`[]`).
 
 ### The Picker
