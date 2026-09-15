@@ -732,7 +732,9 @@ class Picker:
 
     # No assignment covers this key. This is only possible when the
     # initial_assignment_timeout has expired *and* no valid assignments have
-    # been received from the sharding service.
+    # been received from the sharding service. Implementations may choose to use
+    # a different "erroring" picker in this case, and thereby guarantee that
+    # SliceMap lookups always return a valid result.
     if slice_idx is None:
       if self.lb_config.enable_fallback:
         return self.pick_from_endpoint_indices(self.slice_map.fallback_pool, pick_args)
