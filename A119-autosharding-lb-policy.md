@@ -619,70 +619,28 @@ the complete set of endpoint names, combined in chunk order. So, until all
 chunks are received, the `AutoshardingClient` cannot meaningfully use any of
 them.
 
-Once the `AssignmentMetadata` message is received, the `AutoshardingClient` must
-verify that the generation number in the message is strictly greater than any
-previously received generation number. If not, the assignment must be dropped
-with the following `AssignmentAck` message:
+Once the `AssignmentMetadata` message is received, the `AutoshardingClient`
+validates the assignment as follows:
 
-```
-AssignmentAck {
-  generation: <generation number received in AssignmentMetadata>,
-  accepted: false,
-  error_message: <description of the error> 
-}
-```
+1. The `generation` in `AssignmentMetadata` is strictly greater than any
+   previously accepted generation.
+2. Each `Slice` has `start_key <= end_key`, non-overlapping key-ranges, and
+   valid indices into the combined endpoint list. `Slice`s that fail validation
+   are treated as gaps.
 
-If the generation number is valid, the `AutoshardingClient` must validate the
-assignment as follows:
+The `AutoshardingClient` then replies with an `AssignmentAck` (carrying the
+received `generation`) and notifies the LB policy according to the outcome:
 
-* Ensure all endpoint indices specified in the `Slice`s are valid once the
-  endpoint names are combined.
-* Ensure that there are no overlapping key-ranges represented by the `Slice`s.
-* Ensure that the `start_key` is not greater than the `end_key`.
+| Outcome | `accepted` | `error_message` | Action on LB Policy |
+| :--- | :--- | :--- | :--- |
+| **Stale generation** | `false` | Set | None (assignment dropped) |
+| **No usable `Slice`s remain** | `false` | Set | Report error to LB policy |
+| **Some `Slice`s invalid, $\ge 1$ usable** | `true` | Set | Pass gap-filled, sorted `Assignment` |
+| **All `Slice`s valid** | `true` | Empty | Pass gap-filled, sorted `Assignment` |
 
-`AutoshardingClient` must consider `Slice`s that fail validation to be
-equivalent to gaps in the assignment. Handling of gaps is described a little
-further on this section.
-
-If there are usable `Slice`s post validation, the `AutoshardingClient` must send
-an update to the LB policy and must send an `AssignmentAck` message with the
-following contents:
-
-```
-AssignmentAck {
-  generation: <generation number received in AssignmentMetadata>,
-  accepted: true,
-  error_message: <description of the error>
-}
-```
-
-If there are no usable `Slice`s after the validation, the `AutoshardingClient`
-must send an error to the LB policy and must send an `AssignmentAck` message with
-the following contents:
-
-```
-AssignmentAck {
-  generation: <generation number received in AssignmentMetadata>,
-  accepted: false,
-  error_message: <description of the error>
-}
-```
-
-If validation passes, the `AutoshardingClient` must send an `AssignmentAck`
-message with the following contents:
-
-```
-AssignmentAck {
-  generation: <generation number received in AssignmentMetadata>,
-  accepted: true,
-}
-```
-
-and then construct a complete, gap-filled, and sorted `Assignment` as described
-in the [Contract of the AutoshardingClient](#contract-of-the-autoshardingclient)
-section below, and pass it to the LB policy which will then build a new
-`SliceMap` and create new picker with the newly built `SliceMap` and send an
-update to the gRPC channel.
+When `accepted` is `true`, the `Assignment` passed to the LB policy must conform
+to the [Contract of the AutoshardingClient](#contract-of-the-autoshardingclient),
+and the LB policy builds a new `SliceMap` and `Picker` to update the channel.
 
 #### Handling gaps in the assignment
 
