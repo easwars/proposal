@@ -509,20 +509,18 @@ encapsulate all aspects of this communication like managing the stream
 lifecycle, parsing received messages and validating the assignments inside a
 dedicated component named the `AutoshardingClient`.
 
-* Whenever the `channel_factory_key` changes, the LB policy must create a new
-  gRPC channel to the sharding service using the “Channel Factory” provided to
-  it and must pass it to the `AutoshardingClient`.
-* Whenever the `autosharding_target` changes, the LB policy must pass the new
-  value to the `AutoshardingClient`.
+Whenever the `channel_factory_key` or the `autosharding_target` changes, the LB
+policy must create a new `AutoshardingClient`. In the former case, it must also
+create a new gRPC channel to the sharding service using the “Channel Factory”
+provided to it before creating the `AutoshardingClient`.
 
-In both cases, the `AutoshardingClient` must create a new stream and throw away
-any previously received generation number. When the `channel_factory_key`
-changes, the `AutoshardingClient` might be talking to a completely new sharding
-server and when the `autosharding_target` changes, the `AutoshardingClient` is
-requesting assignments for a completely different resource. In both these cases,
-any previously stored generation number is no longer valid. Continuing to use
-them may cause the `AutoshardingClient` to not accept updates from the sharding
-server for a long time.
+When the `channel_factory_key` changes, the `AutoshardingClient` might be
+talking to a completely new sharding server and when the `autosharding_target`
+changes, the `AutoshardingClient` is requesting assignments for a completely
+different resource. In both these cases, any previously stored generation number
+is no longer valid. Continuing to use them may cause the `AutoshardingClient` to
+not accept updates from the sharding server for a long time. Creating a new
+`AutoshardingClient` in these cases gracefully handles these issues.
 
 #### Sending the first message
 
