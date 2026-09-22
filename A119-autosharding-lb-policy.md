@@ -3,8 +3,8 @@ A119: Auto-Sharding LB Policy
 * Author: easwars
 * Approver: markdroth
 * Implemented in: TBD
-* Last updated: 2026-08-27
-* Discussion at: TDB
+* Last updated: 2026-09-21
+* Discussion at: <https://groups.google.com/g/grpc-io/c/BXcwH6ytqRs>
 
 ## Abstract
 
@@ -310,7 +310,7 @@ timer expires, it must build a `SliceMap` and update the parent gRPC Channel
 with a new `Picker`, which then retries any queued RPCs:
 
 * If a valid assignment was received from the sharding service, the new `Picker`
-  will this assignment for the retried RPCs.
+  will use this assignment for the retried RPCs.
 * If the timer expired:
   * If fallback is enabled: RPCs are routed at random to all endpoints provided
     by the Name Resolver.
