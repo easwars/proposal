@@ -124,9 +124,10 @@ implementations may arbitrarily pick one and drop the others.
 ```python
 def build_endpoint_map(resolved_endpoints: list[Endpoint]) -> EndpointMap:
   endpoint_map = EndpointMap(m={})
-  for index, endpoint in enumerate(resolved_endpoints):
+  for endpoint in resolved_endpoints:
+    if endpoint.hostname not in endpoint_map.m:
       endpoint_map.m[endpoint.hostname] = EndpointState(
-          index    = index,
+          index    = len(endpoint_map.m),
           endpoint = endpoint,
       )
   return endpoint_map
