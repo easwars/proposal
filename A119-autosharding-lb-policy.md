@@ -685,6 +685,9 @@ received `generation`) and notifies the LB policy according to the outcome:
 | **Some `Slice`s invalid, $\ge 1$ usable** | `true` | Set | Pass gap-filled, sorted `Assignment` |
 | **All `Slice`s valid** | `true` | Empty | Pass gap-filled, sorted `Assignment` |
 
+Note that an error is reported **only** if a valid assignment was not reported
+previously, as mentioned [here](#contract-of-the-autoshardingclient).
+
 When `accepted` is `true`, the `Assignment` passed to the LB policy must conform
 to the [Contract of the AutoshardingClient](#contract-of-the-autoshardingclient),
 and the LB policy builds a new `SliceMap` and `Picker` to update the channel.
@@ -1125,11 +1128,11 @@ as well, as it will quickly wind up establishing connections to all endpoints.
 ### Why use pre-existing assignments when moving to a new sharding service?
 
 In the [Fallback at Startup](#fallback-at-startup) section, we mentioned that
-the LB policy must continue using previously received valid assignments from the
-sharding server (for a configurable duration) when it creates a gRPC Channel to
-a new sharding service based on a configuration update. While it may seem wrong
-to use assignments from a sharding service that the LB policy is no longer
-expected to be communicating with, there are valid reasons for doing so.
+when the LB policy creates a new `AutoshardingClient`, it continues using a
+valid assignment reported by the previous one until the new one reports either a
+valid assignment or an error. While it may seem wrong to use assignments from an
+`AutoshardingClient` that the LB policy is no longer expected to be using, there
+are valid reasons for doing so.
 
 * Throwing away existing assignments would lead to RPCs getting queued until a
   valid assignment is received, causing an unnecessary spike in latency.
