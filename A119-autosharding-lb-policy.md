@@ -272,14 +272,12 @@ def build_slice_map(endpoint_map: EndpointMap, assignment: Assignment | None) ->
 The LB policy must support a fallback mechanism that utilizes all endpoints
 provided by the Name Resolver. There are two types of fallback:
 
-* Per-slice fallback:
-  * This happens when the LB policy contains valid endpoints and assignments,
-    but all endpoints in the matching `SliceEntry` for an RPC are in
-    `TRANSIENT_FAILURE`.
-* Fallback at startup (see [section](#fallback-at-startup) for more details):
-  * This happens when the following conditions are met:
-    * No valid assignments have been received from the sharding service, and,
-    * Initial assignment timer has expired
+* Per-slice fallback: This happens when the LB policy contains valid endpoints
+  and assignments, but all endpoints in the matching `SliceEntry` for an RPC are
+  in `TRANSIENT_FAILURE`.
+* Fallback at startup: This happens when the `AutoshardingClient` returns an
+  error. See [AutoshardingClient](#contract-of-the-autoshardingclient) for more
+  details on when it returns an error.
 
 Key considerations here:
 
@@ -287,32 +285,27 @@ Key considerations here:
   policy configuration.
 * The LB policy must consider all available endpoints during fallback and must
   not employ any sort of subsetting.
-* The LB policy must continue using previously received good assignments from
-  the sharding service, if it subsequently receives a bad one or if the
-  connection to the sharding service fails.
 
 #### Fallback at Startup
 
-Whenever the LB policy creates a new gRPC Channel to the sharding service, it
-must start a timer for the duration specified by the
-`initial_assignment_timeout` field in the LB policy configuration. There are two
-possible scenarios here:
+When the LB policy creates a new `AutoshardingClient`, it must continue using
+state reported by the previous one (either a valid assignment or an error) until
+it receives state from the new one.
 
-* If the policy contains valid assignments from the previous gRPC Channel, it
-  must continue using them until it receives one from the new gRPC Channel or
-  the timer expires. While the timer is pending and the LB policy is using the
-  existing assignment, it must continue to process endpoint updates from the
-  Name Resolver and state updates from the child LB policies as normal.
-* If the policy does not contain valid assignments, it must queue RPCs until it
-  receives one from the new gRPC Channel or the timer expires.
+* If the LB policy is using an existing assignment, it must continue to process
+  endpoint updates from the Name Resolver and state updates from the child LB
+  policies as normal.
+* If the LB policy does not contain any state from the previous
+  `AutoshardingClient`, it must queue RPCs until it receives state from the new
+  one.
 
-When the policy receives a valid assignment from the sharding server or the
-timer expires, it must build a `SliceMap` and update the parent gRPC Channel
-with a new `Picker`, which then retries any queued RPCs:
+When the policy receives state from the newly created `AutoshardingClient`, it
+must build a `SliceMap` and update the parent gRPC Channel with a new `Picker`,
+which then retries any queued RPCs:
 
-* If a valid assignment was received from the sharding service, the new `Picker`
-  will use this assignment for the retried RPCs.
-* If the timer expired:
+* If a valid assignment is received , the new `Picker` will use this assignment
+  for the retried RPCs.
+* If an error is received:
   * If fallback is enabled: RPCs are routed at random to all endpoints provided
     by the Name Resolver.
   * If fallback is disabled: RPCs fail until a valid assignment is received.
@@ -396,12 +389,10 @@ When the LB policy receives a configuration update, it must do the following:
   channel to this target
   URI](#creating-a-grpc-channel-to-the-autosharding-service). If a new gRPC
   channel is created:
-  * Pass it to the existing `AutoshardingClient` or create a new one, and,
   * Close the previously created gRPC channel to the sharding service
-* If the `autosharding_target` field has changed, pass it to the
-  `AutoshardingClient` which will create a new `WatchShardingAssignment` stream
-  because the `autosharding_target` controls the assignments sent by the
-  sharding service.
+  * Create a new `AutoshardingClient`
+* If the `autosharding_target` field has changed, create a new
+  `AutoshardingClient`.
 
 When the LB policy receives endpoints from the Name Resolver, it must do the
 following:
@@ -410,8 +401,9 @@ following:
   subchannels for the addresses within the endpoints. See [this
   section](#interactions-with-pick_first) for more details.
 * Update the `EndpointMap` accordingly.
-* Build a new `SliceMap` unless the initial assignment timer is active. See
-  section [Building the SliceMap](#building-the-slicemap) for more information.
+* Build a new `SliceMap` unless it is yet to receive an assignment from the
+  `AutoshardingClient`. See section [Building the
+  SliceMap](#building-the-slicemap) for more information.
   * Build a new `Picker` that uses the above `SliceMap`.
 
 If the LB policy receives an empty set of endpoints from the Name Resolver, it
@@ -510,10 +502,13 @@ encapsulate all aspects of this communication like managing the stream
 lifecycle, parsing received messages and validating the assignments inside a
 dedicated component named the `AutoshardingClient`.
 
-Whenever the `channel_factory_key` or the `autosharding_target` changes, the LB
-policy must create a new `AutoshardingClient`. In the former case, it must also
-create a new gRPC channel to the sharding service using the “Channel Factory”
-provided to it before creating the `AutoshardingClient`.
+#### Creating the AutoshardingClient
+
+The LB policy must create a new instance of the `AutoshardingClient` whenever
+the `channel_factory_key` or the `autosharding_target` field in the
+configuration changes. In the former case, it must also create a new gRPC
+channel to the sharding service using the “Channel Factory” provided to it
+before creating the `AutoshardingClient`.
 
 When the `channel_factory_key` changes, the `AutoshardingClient` might be
 talking to a completely new sharding server and when the `autosharding_target`
@@ -523,16 +518,14 @@ is no longer valid. Continuing to use them may cause the `AutoshardingClient` to
 not accept updates from the sharding server for a long time. Creating a new
 `AutoshardingClient` in these cases gracefully handles these issues.
 
-#### Sending the first message
+At creation time, the `AutoshardinClient` is passed the following:
 
-The LB policy sends an `InitialClientConfig` message on the stream to kick
-things off. This message currently contains three fields:
-
-* `target`: The value for this field is derived from the `autosharding_target`
-  field of the LB policy configuration. If a `%s` tokens is present in this
-  string, it is replaced with the “Locality” value  passed to the LB policy as
-  attributes in the resolver update (similar to how the “Channel Factory” is
-  passed).
+* A gRPC channel to the autosharding service.
+* A string that uniquely identifies an assignment in the autosharding service.
+  This string is derived from the `autosharding_target` field of the LB policy
+  configuration. If a `%s` token was present in configuration field, the LB
+  policy must replace it with the “Locality” value  passed to it as a resolver
+  state attribute (similar to how the “Channel Factory” is passed).
   * In xDS use-cases, the “Locality” value is currently populated by the
     `weighted_target_experimental` LB policy as a resolver state attribute, and
     is available to all LB policies that sit underneath it.
@@ -549,11 +542,55 @@ things off. This message currently contains three fields:
     user to ensure that this attribute is populated by the Name Resolver. If
     this attribute is not available, the LB policy will replace the `%s` token
     with an empty string.
-* `client_uuid`: The LB policy generates a UUID at creation time and must reuse
+* A UUID created by the LB policy time at build time. The `AutoshardingClient`
+  must reuse this value across stream restarts.
+* A timeout that determines how long to should wait for the initial assignment
+  from the sharding service. The LB policy passes the value of the
+  `initial_assignment_timeout` field from the LB policy configuration here.
+
+#### Contract of the AutoshardingClient
+
+To ensure that the LB policy's implementation to build a `SliceMap` can remain
+simple and the picker's binary search on the `SliceMap` remains fast and
+correct, the `AutoshardingClient` must produce an `Assignment` that conforms to
+the following rules:
+
+1. The list of `Slice`s must cover the entire possible keyspace, starting from
+   the minimum possible key (the empty byte string `b""`) and ending with the
+   maximum possible key (infinity, represented as `None`).
+2. The `slices` list must be sorted in ascending lexicographical order by
+   `start_key`.
+3. The partitioning must be contiguous and non-overlapping. For every slice
+   index `i` from `0` to `N - 2`, `slices[i].end_key` must exactly equal
+   `slices[i + 1].start_key`.
+4. Any gaps in the key-ranges returned by the autosharding server must be
+   explicitly filled by the `AutoshardingClient` as a `Slice` entry with an
+   empty `endpoints` list (`[]`).
+
+The `AutoshardingClient` must report valid assignments to the LB policy as and
+when it receives them from the autosharding server. If it encounters errors, it
+must report them to the LB policy **only** if it did not previously report a
+valid assignment. Once a given `AutoshardingClient` reports a valid assignment,
+it does not need to report any errors after that, because the LB policy will
+continue to use the previous valid assignment.
+
+The `AutoshardingClient` must report the following scenarios as errors:
+
+* The stream fails without receiving a valid assignment
+* The stream receives an invalid assignment
+* The initial assignment timer fires before it receives a complete assignment
+
+#### Sending the first message
+
+The `AutoshardingClient` sends an `InitialClientConfig` message on the stream to
+kick things off. This message currently contains three fields:
+
+* `target`: The autosharding target string passed to it at creation time.
+* `client_uuid`: The UUID string passed to it at creation time.
   the same value across stream restarts.
-* `latest_generation`: The LB policy must store the generation number of the
-  most recent good assignment received from the sharding service and use that
-  value here.
+* `latest_generation`: The generation number of the most recent valid assignment
+  received by this `AutoshardingClient` or `0` if it is yet to receive any valid
+  assignment.
   * This allows the sharding service to not resend a previously sent good
     assignment in the case of a stream failure.
 
@@ -563,14 +600,14 @@ Responses received from the sharding server in a
 `WatchShardingAssignmentResponse` message can one of the following:
 
 * `AssignmentChunk`: This contains one chunk of a logical assignment from the
-  sharding server. The LB policy must cache chunks until it receives an
-  `AssignmentMetadata` message.
+  sharding server. The `AutoshardingClient` must cache chunks until it receives
+  an `AssignmentMetadata` message.
 * `AssignmentMetadata`: This indicates the end of a logical assignment from the
-  sharding server. The LB policy must attempt to combine previously received
-  chunks into one single logical assignment.
+  sharding server. The `AutoshardingClient` must attempt to combine previously
+  received chunks into one single logical assignment.
 * `LoadReportingConfig`: This contains configuration for how load needs to be
-  aggregated and sent to the sharding server. The LB policy must ignore this
-  message for the time being.
+  aggregated and sent to the sharding server. This message must be ignored for
+  the time being.
 
 See section on [Handling assignments from the sharding
 server](#handling-assignments-from-the-autosharding-server) for more
@@ -579,13 +616,13 @@ information.
 #### Backoff on stream and connectivity failures
 
 When a `WatchShardingAssignment` stream fails without receiving at least one
-good logical assignment, the LB policy must use exponential backoff before each
-successive attempt to re-establish the stream. The algorithm should be similar
-to what gRPC uses for connection attempts. The backoff state will be reset when
-a `WatchShardingAssignment` stream finally receives a good logical assignment
-from the server.  Implementations should use the `wait_for_ready` option on the
-`WatchShardingAssignment` stream to help recover faster from connectivity
-failures instead of applying a backoff when stream creation fails.
+good logical assignment, the `AutoshardingClient` must use exponential backoff
+before each successive attempt to re-establish the stream. The algorithm should
+be similar to what gRPC uses for connection attempts. The backoff state will be
+reset when a `WatchShardingAssignment` stream finally receives a good logical
+assignment from the server.  Implementations should use the `wait_for_ready`
+option on the `WatchShardingAssignment` stream to help recover faster from
+connectivity failures instead of applying a backoff when stream creation fails.
 
 #### Handling assignments from the Autosharding server
 
@@ -625,7 +662,7 @@ validates the assignment as follows:
 
 1. The `generation` in `AssignmentMetadata` is strictly greater than any
    previously accepted generation.
-2. Each `Slice` has `start_key <= end_key`, non-overlapping key-ranges, and
+2. Each `Slice` has `start_key < end_key`, non-overlapping key-ranges, and
    valid indices into the combined endpoint list. `Slice`s that fail validation
    are treated as gaps.
 
@@ -649,25 +686,6 @@ Gaps in the key-ranges represented by the `Slice`s within an assignment are
 allowed. In this case, the `AutoshardingClient` must fill these gaps with
 `Slice`s that contain no endpoints. This will cause requests that match these
 `Slice`s to fallback (if enabled) or fail.
-
-#### Contract of the AutoshardingClient
-
-To ensure that the LB policy's implementation to build a `SliceMap` can remain
-simple and the picker's binary search on the `SliceMap` remains fast and
-correct, the `AutoshardingClient` must produce an `Assignment` that conforms to
-the following rules:
-
-1. The list of `Slice`s must cover the entire possible keyspace, starting from
-   the minimum possible key (the empty byte string `b""`) and ending with the
-   maximum possible key (infinity, represented as `None`).
-2. The `slices` list must be sorted in ascending lexicographical order by
-   `start_key`.
-3. The partitioning must be contiguous and non-overlapping. For every slice
-   index `i` from `0` to `N - 2`, `slices[i].end_key` must exactly equal
-   `slices[i + 1].start_key`.
-4. Any gaps in the key-ranges returned by the autosharding server must be
-   explicitly filled by the `AutoshardingClient` as a `Slice` entry with an
-   empty `endpoints` list (`[]`).
 
 ### The Picker
 
