@@ -435,6 +435,12 @@ Implementations must ensure the key uniquely encodes all parameters necessary
 for channel creation. For example, credentials need only be included in the key
 if the factory supports creating channels with different credentials.
 
+If the `channel_factory_key` is unrecognized or disallowed, or if channel
+creation fails for any other reason, the “Channel Factory” must indicate this
+failure to the LB policy. Depending on the language, the factory may either
+return an error directly (as in Go) or return a "lame" channel that fails all
+RPCs with an appropriate status message (as in C++).
+
 In xDS-based deployments, this “Channel Factory” will be injected by the
 `cds_experimental` LB policy. Refer to section [Changes to CDS LB
 policy](#changes-to-cds-lb-policy) for more details. For non-xDS environments,
