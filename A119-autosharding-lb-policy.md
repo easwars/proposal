@@ -385,14 +385,17 @@ the "Channel Factory".
 When the LB policy receives a configuration update, it must do the following:
 
 * If the `channel_factory_key` field has changed (or if this is the
-  first configuration update), use the “Channel Factory” to [create a new gRPC
-  channel to this target
-  URI](#creating-a-grpc-channel-to-the-autosharding-service). If a new gRPC
-  channel is created:
-  * Close the previously created gRPC channel to the sharding service
-  * Create a new `AutoshardingClient`
-* If the `autosharding_target` field has changed, create a new
-  `AutoshardingClient`.
+  first configuration update):
+  * Use the “Channel Factory” to [create a new gRPC channel using this
+    key](#creating-a-grpc-channel-to-the-autosharding-service).
+  * If gRPC channel creation succeeds, create a new `AutoshardingClient`.
+  * Else, handle the failure in the same way an error from the
+    `AutoshardingClient` is handled, i.e., entering fallback mode if fallback is
+    enabled or failing RPCs if fallback is not enabled.
+  * Close the previously created `AutoshardingClient` and gRPC channel to the
+    sharding service, if any.
+* Else if the `autosharding_target` field has changed, close the previously
+  created `AutoshardingClient` and create a new `AutoshardingClient`.
 
 When the LB policy receives endpoints from the Name Resolver, it must do the
 following:
