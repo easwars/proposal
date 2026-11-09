@@ -2,8 +2,8 @@ A119: Auto-Sharding LB Policy
 ----
 * Author: easwars
 * Approver: markdroth
-* Implemented in: TBD
-* Last updated: 2026-10-29
+* Implemented in: Go
+* Last updated: 2026-11-09
 * Discussion at: <https://groups.google.com/g/grpc-io/c/BXcwH6ytqRs>
 
 ## Abstract
@@ -201,6 +201,11 @@ class PickerEndpoint:
   # exist, the implementation MUST lazily create it before triggering the
   # connection attempt. Implementations are free to use a type that is
   # most appropriate for them.
+  #
+  # A name resolver update that removes an endpoint can race with an active pick
+  # attempt targeting that same endpoint. This can lead to the creation of a
+  # child policy for the removed endpoint. Implementations must guarantee that
+  # child policies are not leaked in such scenarios and are properly cleaned up.
   endpoint: ExitIdler | EndpointState
 ```
 
@@ -419,24 +424,26 @@ cancel the initial assignment timer if it is still running):
 When the LB policy creates a new `AutoshardingClient`, there will be a delay
 before the client can return an assignment or error to the LB policy.
 
-If the LB policy does not already have a result from a previous
-`AutoshardingClient` instance (i.e., when the LB policy first starts up), the LB
-policy must queue all picks while it waits for the assignment. The Picker must
-set `delay_type` to "autosharding_assignment_pending". See [WIP gRFC
+If the LB policy does not already have a result (a valid assignment or error)
+from a previous `AutoshardingClient` instance (i.e., when the LB policy first
+starts up), the LB policy must queue all picks while it waits for a result. The
+Picker must set `delay_type` to "autosharding_assignment_pending". See [WIP gRFC
 A121][A121].
 
 However, if the LB policy does already have a result from a previous
 `AutoshardingClient` (i.e., when the LB policy creates a new
 `AutoshardingClient` due to a config change), the LB policy must continue using
-the assignment or error returned by the previous `AutoshardingClient` until it
-gets the initial result from the new `AutoshardingClient`. While the LB policy
-is using an existing assignment, it must continue to process endpoint updates
-from the Name Resolver and state updates from the child LB policies as normal.
+it until it gets the initial result from the new `AutoshardingClient`. While the
+LB policy is using an existing result, it must continue to process endpoint
+updates from the Name Resolver and state updates from the child LB policies as
+normal.
 
 Whenever the `AutoshardingClient` returns a result to the LB policy via the
 registered callback, the LB policy updates its `self.assignment` field
 (synchronized with updates from the Name Resolver and child LB policies) and
-updates the channel state and picker, which will retry any queued RPCs:
+updates the channel state and picker, which will retry any queued RPCs.
+Implementations must protect themselves against updates from old clients during
+this swtich.
 
 ```python
 def on_assignment_update(self, assignment: Assignment | Error):  
@@ -534,7 +541,8 @@ validates the assignment as follows:
    previously accepted generation.
 2. Each `Slice` has `start_key < end_key`, non-overlapping key-ranges, and
    all indices into the combined endpoint list are valid. `Slice`s that fail
-   validation are treated as gaps.
+   validation are treated as gaps. In the case of overlaps, all overlapping
+   slices are invalid and treated as gaps.
 
 The `AutoshardingClient` then replies with an `AssignmentAck` (carrying the
 received `generation`) and notifies the LB policy according to the outcome:
@@ -542,17 +550,18 @@ received `generation`) and notifies the LB policy according to the outcome:
 | Outcome | `accepted` | `error_message` | Action on LB Policy |
 | :--- | :--- | :--- | :--- |
 | **Stale generation** | `false` | Set | None (assignment dropped) |
-| **No usable `Slices` remain** | `false` | Set | Report error to LB policy |
+| **No valid `Slices` remain** | `false` | Set | Report error to LB policy |
 | **Some gaps in `Slices`** | `true` | Set | Pass gap-filled, sorted `Assignment` |
-| **Some `Slices` invalid, $\ge 1$ usable** | `true` | Set | Pass gap-filled, sorted `Assignment` |
+| **Some `Slices` invalid, $\ge 1$ valid** | `true` | Set | Pass gap-filled, sorted `Assignment` |
 | **All `Slices` valid** | `true` | Empty | Pass gap-filled, sorted `Assignment` |
 
-Note that an error is reported **only** if a valid assignment was not reported
-previously, as mentioned [previously here](#contract-of-the-autoshardingclient).
-
-When `accepted` is `true`, the `Assignment` passed to the LB policy must conform
-to the [Contract of the AutoshardingClient](#contract-of-the-autoshardingclient),
-and the LB policy builds a new `SliceMap` and `Picker` to update the channel.
+A valid slice is one that was received from the sharding server and passed
+validation checks. Note that an error is reported **only** if a valid assignment
+was not reported previously, as mentioned [previously
+here](#contract-of-the-autoshardingclient). When `accepted` is `true`, the
+`Assignment` passed to the LB policy must conform to the [Contract of the
+AutoshardingClient](#contract-of-the-autoshardingclient), and the LB policy
+builds a new `SliceMap` and `Picker` to update the channel.
 
 #### Handling gaps in the assignment
 
@@ -684,12 +693,14 @@ pseudo-code:
 def handle_name_resolver_update(
     self, state: ResolverState, config: LbConfig
 ) -> Status:
+  # Reset the most recent resolver error.
+  self.resolver_error = None
+
   # Fail if no channel factory in resolver state attributes.
   channel_factory = get_channel_factory_from_resolver_state(state)
   if channel_factory is None:
-    self.update_channel_state(
-        TRANSIENT_FAILURE, ErrorPicker("no channel factory in resolver state")
-    )
+    self.resolver_error = Error("no channel factory in resolver state")
+    self.update_state_and_picker(false)
     return BAD_RESOLVER_STATE
 
   # Update the EndpointMap with the new set of filtered endpoints and lazily
@@ -698,10 +709,9 @@ def handle_name_resolver_update(
   self.update_child_policies()
 
   # Fail if there are no valid endpoints.
-  if not self.endpoint_map:
-    self.update_channel_state(
-        TRANSIENT_FAILURE, ErrorPicker("no endpoints from resolver")
-    )
+  if not self.endpoint_map.m:
+    self.resolver_error = Error("no endpoints from resolver")
+    self.update_state_and_picker(false)
     return BAD_RESOLVER_STATE
 
   # Reuse the existing gRPC channel unless channel_factory_key has changed.
@@ -749,6 +759,10 @@ def handle_name_resolver_update(
   return OK
 
 def update_state_and_picker(self, regenerate_slice_map: bool):
+  if self.resolver_error is not None:
+    self.update_channel_state(TRANSIENT_FAILURE, ErrorPicker(self.resolver_error))
+    return
+
   # If the LB policy is yet to receive an assignment or error from the
   # AutoshardingClient, RPCs must be queued.
   if self.assignment is None:
