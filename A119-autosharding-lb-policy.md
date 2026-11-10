@@ -375,7 +375,7 @@ At creation time, the `AutoshardingClient` is passed the following:
   This string is derived from the `autosharding_target` field of the LB policy
   configuration. If a `%s` token was present in configuration field, the LB
   policy must replace it with the “Locality” value passed to it as a resolver
-  state attribute (similar to how the “Channel Factory” is passed).
+  state attribute.
   * In xDS use-cases, the “Locality” value is currently populated by the
     `weighted_target_experimental` LB policy as a resolver state attribute, and
     is available to all LB policies that sit underneath it.
@@ -387,6 +387,10 @@ At creation time, the `AutoshardingClient` is passed the following:
       and endpoint picking, the “Locality” value will not be part of the
       `autosharding_target` field of the LB policy configuration, as the policy
       will handle endpoints from all localities.
+    * The string representation of an xDS locality is specified in the [Optional
+      xDS Locality
+      Label](https://github.com/grpc/proposal/blob/master/A78-grpc-metrics-wrr-pf-xds.md#optional-xds-locality-label)
+      section of [gRFC A78][A78].
   * In non-xDS use-cases, the common case is for the `autosharding_target` to
     not contain `%s` tokens. But if they do, it is the responsibility of the
     user to ensure that this attribute is populated by the Name Resolver. If
@@ -995,7 +999,7 @@ class Picker:
     # fallback is disabled regardless of lb_config.enable_fallback.
     slice_entry = self.slice_map.slices[slice_idx]
     if slice_entry.fallback_disabled:
-      return PICK_DROP(Unavailable)
+      return PICK_FAILED(Unavailable)
 
     # Matching key range is in fallback mode and fallback is enabled
     if self.slice_in_fallback[slice_idx] and self.lb_config.enable_fallback:
