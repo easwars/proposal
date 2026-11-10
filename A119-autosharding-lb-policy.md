@@ -121,19 +121,41 @@ connectivity state and picker returned by that policy. We'll call this map the
 
 ```python
 # Endpoint state used in the LB policy.
+#
+# The same EndpointState object is retained (and updated in place) across Name
+# Resolver updates for as long as the endpoint is present. This guarantees that
+# references to it held by the child policy (for delivering state updates) and
+# by previously created pickers (for requesting connections) remain valid.
 class EndpointState:
   index:    int                # Index of the endpoint within the NR update
   endpoint: Endpoint           # The actual endpoint returned by the NR
   child_lb: Balancer           # Child balancer managing the endpoint
   state:    ConnectivityState  # Most recent connectivity state of the endpoint
   picker:   Picker             # Most recent picker returned by the child balancer
+  removed:  bool               # Set when the endpoint is removed by the NR
 
   # Called to request a connection.
   # Lazily creates the LB policy as needed.
   def request_connection(self):
+    if self.removed:
+      return
     if self.child_lb is None:
       # ...create child policy...
     self.child_lb.exit_idle()
+
+  # Called when a Name Resolver update retains this endpoint.
+  def update(self, index: int, endpoint: Endpoint):
+    self.index = index
+    self.endpoint = endpoint
+    if self.child_lb is not None:
+      self.child_lb.update(endpoint.addresses)
+
+  # Called when a Name Resolver update removes this endpoint.
+  def shutdown(self):
+    self.removed = True
+    if self.child_lb is not None:
+      self.child_lb.close()
+      self.child_lb = None
 
 # Map from endpoint hostname to endpoint state
 class EndpointMap:
@@ -145,7 +167,7 @@ endpoints from the Name Resolver. If multiple endpoints share the same hostname,
 implementations may arbitrarily pick one and drop the others.
 
 ```python
-# Builds an endpointMap with the new set of resolver endpoints.
+# Builds an EndpointMap with the new set of resolver endpoints.
 def update_endpoint_map(self, resolved_endpoints: list[Endpoint]):
   old_map = self.endpoint_map.m if self.endpoint_map is not None else {}
   new_map = EndpointMap(m={})
@@ -155,34 +177,30 @@ def update_endpoint_map(self, resolved_endpoints: list[Endpoint]):
     if endpoint.hostname in new_map.m:
       continue
 
-    if endpoint.hostname in old_map:
-      # Retain existing child LB state for endpoints still present.
-      prev = old_map[endpoint.hostname]
-      new_map.m[endpoint.hostname] = EndpointState(
-          index    = len(new_map.m),
-          endpoint = endpoint,
-          child_lb = prev.child_lb,
-          state    = prev.state,
-          picker   = prev.picker,
-      )
-    else:
-      new_map.m[endpoint.hostname] = EndpointState(
-          index    = len(new_map.m),
-          endpoint = endpoint,
-      )
+    # Retain the existing EndpointState object (not a copy) for endpoints
+    # still present, so that references to it remain valid.
+    es = old_map.pop(endpoint.hostname, None)
+    if es is None:
+      es = EndpointState()
+    es.update(index=len(new_map.m), endpoint=endpoint)
+    new_map.m[endpoint.hostname] = es
 
-  # Shut down child policies for endpoints removed in this update.
-  for hostname, es in old_map.items():
-    if hostname not in new_map.m and es.child_lb is not None:
-      es.child_lb.close()
+  # Anything left in old_map was removed in this update.
+  for es in old_map.values():
+    es.shutdown()
 
   self.endpoint_map = new_map
 ```
 
-The pseudo-code above handles closing of child policies associated with removed
-endpoints. Implementations could delegate that responsibility to a utility (for
-example, in Go, this will be handled by the `endpointsharding` LB policy which
-will be configured as the child of `autosharding_experimental`).
+The pseudo-code above retains the `EndpointState` (and its child policy) by
+hostname and pushes updated addresses to the child policy. Implementations may
+use a different notion of identity for retaining an `EndpointState` and its child
+policy across updates, as long as the `EndpointState` and the child policy are
+always retained or replaced together. For example, in Go, child policies are
+managed by the `endpointsharding` LB policy, which identifies its children by the
+set of addresses in the endpoint. So the Go implementation retains `EndpointState`
+objects keyed by that set of addresses. When a hostname moves to a different set
+of addresses, a new `EndpointState` and child policy are created for it.
 
 The LB policy must update the existing `EndpointMap` when it receives an
 update from the child policy. This means that the `EndpointMap` cannot be shared
@@ -203,9 +221,9 @@ class PickerEndpoint:
   # most appropriate for them.
   #
   # A name resolver update that removes an endpoint can race with an active pick
-  # attempt targeting that same endpoint. This can lead to the creation of a
-  # child policy for the removed endpoint. Implementations must guarantee that
-  # child policies are not leaked in such scenarios and are properly cleaned up.
+  # attempt targeting that same endpoint. Implementations must guarantee that a
+  # child policy is not created (or leaked) for an endpoint that has been
+  # removed. In the pseudo-code above, this is done via EndpointState.removed.
   endpoint: ExitIdler | EndpointState
 ```
 
@@ -448,7 +466,8 @@ this swtich.
 ```python
 def on_assignment_update(self, assignment: Assignment | Error):  
   self.assignment = assignment  
-  self.update_state_and_picker(True)  
+  self.slice_map = build_slice_map(self.endpoint_map, self.assignment)
+  self.update_state_and_picker()
 ```
 
 The resulting picker behavior will be as follows (first match wins):
@@ -700,18 +719,19 @@ def handle_name_resolver_update(
   channel_factory = get_channel_factory_from_resolver_state(state)
   if channel_factory is None:
     self.resolver_error = Error("no channel factory in resolver state")
-    self.update_state_and_picker(false)
+    self.update_state_and_picker()
     return BAD_RESOLVER_STATE
 
   # Update the EndpointMap with the new set of filtered endpoints and lazily
   # create/remove `pick_first` child policies for each endpoint.
   self.update_endpoint_map(state.endpoints)
   self.update_child_policies()
+  self.slice_map = build_slice_map(self.endpoint_map, self.assignment)
 
   # Fail if there are no valid endpoints.
   if not self.endpoint_map.m:
     self.resolver_error = Error("no endpoints from resolver")
-    self.update_state_and_picker(false)
+    self.update_state_and_picker()
     return BAD_RESOLVER_STATE
 
   # Reuse the existing gRPC channel unless channel_factory_key has changed.
@@ -755,10 +775,10 @@ def handle_name_resolver_update(
   # Update cached copy of the configuration before building the new Picker.
   self.config = config
 
-  self.update_state_and_picker(True)
+  self.update_state_and_picker()
   return OK
 
-def update_state_and_picker(self, regenerate_slice_map: bool):
+def update_state_and_picker(self):
   if self.resolver_error is not None:
     self.update_channel_state(TRANSIENT_FAILURE, ErrorPicker(self.resolver_error))
     return
@@ -776,10 +796,6 @@ def update_state_and_picker(self, regenerate_slice_map: bool):
         TRANSIENT_FAILURE, ErrorPicker(self.assignment.error())
     )
     return
-
-  # Rebuild the SliceMap only when required.
-  if regenerate_slice_map:
-    self.slice_map = build_slice_map(self.endpoint_map, self.assignment)
 
   # Compute the channel's aggregated connectivity state.
   agg_state = self.compute_aggregated_connectivity_state()
@@ -803,19 +819,35 @@ def update_state_and_picker(self, regenerate_slice_map: bool):
 
 When the LB policy receives a state update from one of its child policies
 containing the new connectivity state and picker for the child policy, it
-updates the corresponding `EndpointState` in `EndpointMap` and invokes
+updates the `EndpointState` that owns that child policy and invokes
 `update_state_and_picker()` (shown in the [Handling updates from the Name
 Resolver](#handling-updates-from-the-name-resolver) section above).
-Implementations must ensure that a lingering callback from a child policy for an
-endpoint that has since been removed by the Name Resolver is handled gracefully.
+
+Implementations must not identify the `EndpointState` to update by looking up
+the endpoint's hostname in the `EndpointMap`. A Name Resolver update may have
+reassigned the hostname to a different endpoint, and the state update may be a
+lingering one from the child policy of the old endpoint. Instead:
+
+* Implementations where the child policy's callbacks hold a direct reference to
+  the `EndpointState` (as in the pseudo-code below) must ignore updates for an
+  `EndpointState` that has been removed.
+* Implementations that receive child state updates tagged with an identifier
+  must look up the `EndpointState` using the same identity that was used to
+  create the child policy, and must ignore updates for which no such
+  `EndpointState` exists. For example, in Go, the `endpointsharding` LB policy
+  reports per-child state along with the child's endpoint, and the
+  `EndpointState` is looked up using the set of addresses in that endpoint.
 
 ```python
 def handle_child_policy_update(
     self, es: EndpointState, new_state: ConnectivityState, new_picker: Picker
 ):
+  # Ignore lingering updates from the child policy of a removed endpoint.
+  if es.removed:
+    return
   es.state = new_state
   es.picker = new_picker
-  self.update_state_and_picker(False)
+  self.update_state_and_picker()
 ```
 
 Note that since the order or number of endpoints did not change as part of a
@@ -941,7 +973,8 @@ class Picker:
     return all(self.endpoints[i].state == TRANSIENT_FAILURE for i in indices)
 
   def pick(self, pick_args: PickArgs) -> PickResult:
-    # Extract sharding key from request metadata/header
+    # Extract sharding key from request metadata/header. If the key contains
+    # multiple values, use the first one.
     key = extract_key_from_metadata(pick_args, self.lb_config.key_header_name)
     if key is None:
       return PICK_DROP(Internal)
