@@ -789,13 +789,6 @@ def handle_name_resolver_update(
   # Reset the most recent resolver error.
   self.resolver_error = None
 
-  # Fail if no channel factory in resolver state attributes.
-  channel_factory = get_channel_factory_from_resolver_state(state)
-  if channel_factory is None:
-    self.resolver_error = Error("no channel factory in resolver state")
-    self.update_state_and_picker()
-    return BAD_RESOLVER_STATE
-
   # Update the EndpointMap with the new set of filtered endpoints and lazily
   # create/remove `pick_first` child policies for each endpoint.
   self.update_endpoint_map(state.endpoints)
@@ -817,6 +810,13 @@ def handle_name_resolver_update(
       self.autosharding_client is None
       or config.channel_factory_key != self.config.channel_factory_key
   ):
+    # Fail if no channel factory in resolver state attributes.
+    channel_factory = get_channel_factory_from_resolver_state(state)
+    if channel_factory is None:
+      self.resolver_error = Error("no channel factory in resolver state")
+      self.update_state_and_picker()
+      return BAD_RESOLVER_STATE
+
     # Depending on the language, channel_factory may either return a LameChannel
     # directly on failure (e.g., C++) or return an error that the LB policy
     # wraps in a LameChannel (e.g., Go).
@@ -1189,8 +1189,8 @@ to reconnect with exponential backoff until they become `READY`.
 
 The LB policy will use the same rules used by the `ring_hash` LB policy, as
 described in [gRFC A42][A42] to determine the aggregated connectivity state of
-the gRPC Channel. The complete connectivity state aggregation rules are as
-follows:
+the gRPC Channel. Children in pending-creation state are considered `IDLE` for
+these rules. The complete connectivity state aggregation rules are as follows:
 
 1. If there is at least one child policy in `READY` state, report `READY`.
 2. If there are 2 or more children in `TRANSIENT_FAILURE` state, report
