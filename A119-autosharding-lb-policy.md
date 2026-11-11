@@ -642,7 +642,7 @@ following happens:
 
 When `initial_connect_pending` is set and a result is available from the
 `AutoshardingClient`, the LB policy reports `CONNECTING` instead of the
-aggregated state, and does not apply the proactive connection rule from
+aggregated state, and does not apply the proactive connection rule from the
 [Aggregated Connectivity State](#aggregated-connectivity-state) section.
 
 When the first usable result (a valid assignment, or an error with fallback
@@ -660,23 +660,17 @@ def maybe_start_initial_connect(self, first_result: bool):
   if first_result and usable and self.initial_connect_pending:
     if self.seen_exit_idle:
       self.connect_to_random_idle_endpoint()
-    self.start_timer(500ms, self.on_initial_connect_timer)
+    self.start_initial_connect_timer()
 
 def on_initial_connect_timer(self):
   if self.initial_connect_pending:
     self.connect_to_random_idle_endpoint()
-    self.start_timer(500ms, self.on_initial_connect_timer)
+    self.start_initial_connect_timer()
 
 def clear_initial_connect(self):
   self.initial_connect_pending = False
   self.seen_exit_idle = False
   self.cancel_initial_connect_timer()
-
-def exit_idle(self):
-  if self.initial_connect_pending:
-    self.seen_exit_idle = True
-  if self.current_state == IDLE:
-    self.connect_to_random_idle_endpoint()
 ```
 
 ### Fallback Mechanism
@@ -937,7 +931,7 @@ def handle_child_policy_update(
       e.state != IDLE for e in self.endpoint_map.m.values()
   ):
     self.clear_initial_connect()
-  
+
   self.update_state_and_picker()
 ```
 
@@ -947,7 +941,7 @@ building a new `Picker`.
 
 ### Handling requests to exit IDLE
 
-The channel asks the LB policy to exit `IDLE` when, for example the application
+The channel asks the LB policy to exit `IDLE` when, for example, the application
 calls `channel.GetState(try_to_connect=true)`. In line with the behavior
 specified for `ring_hash` in [gRFC A117][A117], the LB policy handles such a
 request as follows:
@@ -1172,13 +1166,13 @@ behavior](#initial-connection-behavior), [Handling requests to exit
 IDLE](#handling-requests-to-exit-idle), and [Aggregated Connectivity
 State](#aggregated-connectivity-state).
 
- `autosharding_experimental` must create a `pick_first` child for every endpoint
- given to it by the Name Resolver.  `pick_first` starts connecting as soon as it
- is given its endpoint. So, `autosharding_experimental` must make sure that the
- child `pick_first` policy is created lazily, when a connection to that endpoint
- needs to be established. This may be accomplished by wrapping `pick_first` in a
- parent policy that creates `pick_first` only when asked to establish a
- connection.
+`autosharding_experimental` must create a `pick_first` child for every endpoint
+given to it by the Name Resolver.  `pick_first` starts connecting as soon as it
+is given its endpoint. So, `autosharding_experimental` must make sure that the
+child `pick_first` policy is created lazily, when a connection to that endpoint
+needs to be established. This may be accomplished by wrapping `pick_first` in a
+parent policy that creates `pick_first` only when asked to establish a
+connection.
 
 The `autosharding_experimental` LB policy also relies on the sticky-TF behavior
 (specified in [gRFC A62][A62]) implemented by the `pick_first` policy, that
