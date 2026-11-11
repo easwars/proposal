@@ -46,12 +46,14 @@ has applications in various scenarios, such as:
 
 * [A42: xDS Ring Hash LB Policy][A42]
 * [A52: gRPC xDS Custom Load Balancer Configuration][A52]
+* [A56: Priority LB Policy][A56]
 * [A62: Pick First][A62]
 * [A74: xDS Config Tears][A74]
 * [A75: xDS Aggregate Cluster Behavior Fixes][A75]
 * [A78: gRPC OTel Metrics for WRR, Pick First, and XdsClient][A78]
 * [A81: xDS Authority Rewriting][A81]
 * [A102: xDS GrpcService Support][A102]
+* [A117: Ring Hash Exit Idle Behavior Changes][A117]
 * [A121: RPC Delay Observability][A121]
 
 ## Proposal
@@ -448,9 +450,13 @@ before the client can return an assignment or error to the LB policy.
 
 If the LB policy does not already have a result (a valid assignment or error)
 from a previous `AutoshardingClient` instance (i.e., when the LB policy first
-starts up), the LB policy must queue all picks while it waits for a result. The
-Picker must set `delay_type` to "autosharding_assignment_pending". See [WIP gRFC
-A121][A121].
+starts up), the LB policy must report `CONNECTING` and queue all picks while it
+waits for a result. The Picker must set `delay_type` to
+"autosharding_assignment_pending". See [WIP gRFC A121][A121]. Reporting
+`CONNECTING` (instead of `IDLE`) here allows the `priority` LB policy (when it
+is an ancestor of this policy) to fail over to a lower priority if a result is
+not received in time. See [Initial connection
+behavior](#initial-connection-behavior) for details.
 
 However, if the LB policy does already have a result from a previous
 `AutoshardingClient` (i.e., when the LB policy creates a new
@@ -465,12 +471,14 @@ registered callback, the LB policy updates its `self.assignment` field
 (synchronized with updates from the Name Resolver and child LB policies) and
 updates the channel state and picker, which will retry any queued RPCs.
 Implementations must protect themselves against updates from old clients during
-this swtich.
+this switch.
 
 ```python
-def on_assignment_update(self, assignment: Assignment | Error):  
-  self.assignment = assignment  
+def on_assignment_update(self, assignment: Assignment | Error):
+  first_result = self.assignment is None
+  self.assignment = assignment
   self.slice_map = build_slice_map(self.endpoint_map, self.assignment)
+  self.maybe_start_initial_connect(first_result)
   self.update_state_and_picker()
 ```
 
@@ -608,6 +616,68 @@ specified any endpoints, even if fallback is enabled in the LB policy
 configuration. This is handled by propagating a `fallback_disabled` flag from
 the `AutoshardingClient` all the way to the picker, and is described in detail
 in sections on [fallback](#fallback-mechanism) and on the [Picker](#the-picker).
+
+### Initial connection behavior
+
+Because this LB policy creates connections lazily, all endpoints are `IDLE`
+when the first result is received from the `AutoshardingClient`. The
+[aggregation rules](#aggregated-connectivity-state) would therefore cause the
+LB policy to transition from `CONNECTING` to `IDLE`, and then back to
+`CONNECTING` once a pick triggers a connection attempt. When the `priority` LB
+policy is an ancestor of this policy, reporting `IDLE` cancels its failover
+timer, and moving back to `CONNECTING` starts a new one. This effectively
+extends the time it takes to fail over to a lower priority.
+
+To avoid this, the LB policy maintains an `initial_connect_pending` flag. The
+flag is set when the LB policy is created and is cleared when either of the
+following happens:
+
+* The LB policy observes that at least one endpoint has moved out of `IDLE`.
+  The flag must be cleared only when a state update from a child policy shows
+  this, not when the LB policy requests a connection, because some
+  implementations request connections asynchronously.
+* The LB policy reports `TRANSIENT_FAILURE`. After this, the `priority` LB
+  policy will have cancelled its failover timer, and reporting `IDLE` later is
+  harmless.
+
+When `initial_connect_pending` is set and a result is available from the
+`AutoshardingClient`, the LB policy reports `CONNECTING` instead of the
+aggregated state, and does not apply the proactive connection rule from
+[Aggregated Connectivity State](#aggregated-connectivity-state) section.
+
+When the first usable result (a valid assignment, or an error with fallback
+enabled) is received while the flag is set, the LB policy starts a 500ms timer
+to give queued RPCs a chance to trigger a connection attempt to the endpoint
+they are routed to. When the timer fires, if the flag is still set, the LB
+policy triggers a connection attempt to a random `IDLE` endpoint and restarts
+the timer (in case that endpoint is removed before it reports a new state). If
+a request to exit `IDLE` was seen while waiting for the result, the LB policy
+also triggers a connection attempt to a random `IDLE` endpoint immediately.
+
+```python
+def maybe_start_initial_connect(self, first_result: bool):
+  usable = not self.assignment.is_error() or self.config.enable_fallback
+  if first_result and usable and self.initial_connect_pending:
+    if self.seen_exit_idle:
+      self.connect_to_random_idle_endpoint()
+    self.start_timer(500ms, self.on_initial_connect_timer)
+
+def on_initial_connect_timer(self):
+  if self.initial_connect_pending:
+    self.connect_to_random_idle_endpoint()
+    self.start_timer(500ms, self.on_initial_connect_timer)
+
+def clear_initial_connect(self):
+  self.initial_connect_pending = False
+  self.seen_exit_idle = False
+  self.cancel_initial_connect_timer()
+
+def exit_idle(self):
+  if self.initial_connect_pending:
+    self.seen_exit_idle = True
+  if self.current_state == IDLE:
+    self.connect_to_random_idle_endpoint()
+```
 
 ### Fallback Mechanism
 
@@ -784,21 +854,30 @@ def handle_name_resolver_update(
 
 def update_state_and_picker(self):
   if self.resolver_error is not None:
+    self.clear_initial_connect()
     self.update_channel_state(TRANSIENT_FAILURE, ErrorPicker(self.resolver_error))
     return
 
   # If the LB policy is yet to receive an assignment or error from the
   # AutoshardingClient, RPCs must be queued.
   if self.assignment is None:
-    self.update_channel_state(IDLE, QueuePicker())
+    self.update_channel_state(CONNECTING, QueuePicker())
     return
 
   # If the LB policy received an error from the AutoshardingClient and
   # fallback is disabled, RPCs must be failed.
   if self.assignment.is_error() and not self.config.enable_fallback:
+    self.clear_initial_connect()
     self.update_channel_state(
         TRANSIENT_FAILURE, ErrorPicker(self.assignment.error())
     )
+    return
+
+  # If no endpoint has moved out of IDLE yet, report CONNECTING instead of the
+  # aggregated state, and do not proactively trigger connection attempts. See
+  # "Initial connection behavior".
+  if self.initial_connect_pending:
+    self.update_channel_state(CONNECTING, self.build_picker())
     return
 
   # Compute the channel's aggregated connectivity state.
@@ -851,12 +930,44 @@ def handle_child_policy_update(
     return
   es.state = new_state
   es.picker = new_picker
+
+  # Once any endpoint moves out of IDLE, the aggregation rules can no longer
+  # result in IDLE. See "Initial connection behavior".
+  if self.initial_connect_pending and any(
+      e.state != IDLE for e in self.endpoint_map.m.values()
+  ):
+    self.clear_initial_connect()
+  
   self.update_state_and_picker()
 ```
 
 Note that since the order or number of endpoints did not change as part of a
 child policy state update, the existing `SliceMap` should be reused when
 building a new `Picker`.
+
+### Handling requests to exit IDLE
+
+The channel asks the LB policy to exit `IDLE` when, for example the application
+calls `channel.GetState(try_to_connect=true)`. In line with the behavior
+specified for `ring_hash` in [gRFC A117][A117], the LB policy handles such a
+request as follows:
+
+* If `initial_connect_pending` is set, the LB policy records that it saw the
+  request. If no result has been received from the `AutoshardingClient` yet,
+  this causes a connection attempt to be triggered as soon as the first usable
+  result is received. See [Initial connection
+  behavior](#initial-connection-behavior).
+* If the most recently reported state is `IDLE`, the LB policy triggers a
+  connection attempt to an `IDLE` endpoint chosen at random.
+* Otherwise, the request is ignored.
+
+```python
+def exit_idle(self):
+  if self.initial_connect_pending:
+    self.seen_exit_idle = True
+  if self.current_state == IDLE:
+    self.connect_to_random_idle_endpoint()
+```
 
 ### Creating a gRPC Channel to the Autosharding Service
 
@@ -1056,13 +1167,18 @@ class Picker:
 
 The LB policy will not proactively connect to endpoints given to it by the Name
 Resolver. Instead, connections are triggered from the picker as described above
-in the picker pseudo-code. `autosharding_experimental` must create a
-`pick_first` child for every endpoint given to it by the Name Resolver.
-`pick_first` starts connecting as soon as it is given its endpoint. So,
-`autosharding_experimental` must make sure that the child `pick_first` policy is
-created lazily, when a connection to that endpoint needs to be established. This
-may be accomplished by wrapping `pick_first` in a parent policy that creates
-`pick_first` only when asked to establish a connection.
+in the picker pseudo-code, except in the cases described in [Initial connection
+behavior](#initial-connection-behavior), [Handling requests to exit
+IDLE](#handling-requests-to-exit-idle), and [Aggregated Connectivity
+State](#aggregated-connectivity-state).
+
+ `autosharding_experimental` must create a `pick_first` child for every endpoint
+ given to it by the Name Resolver.  `pick_first` starts connecting as soon as it
+ is given its endpoint. So, `autosharding_experimental` must make sure that the
+ child `pick_first` policy is created lazily, when a connection to that endpoint
+ needs to be established. This may be accomplished by wrapping `pick_first` in a
+ parent policy that creates `pick_first` only when asked to establish a
+ connection.
 
 The `autosharding_experimental` LB policy also relies on the sticky-TF behavior
 (specified in [gRFC A62][A62]) implemented by the `pick_first` policy, that
@@ -1085,15 +1201,19 @@ follows:
 5. If there is at least one child in `IDLE` state, report `IDLE`.
 6. Otherwise, report `TRANSIENT_FAILURE`.
 
-Unlike most other LB policies, which start off in `CONNECTING`, this policy
-starts off in `IDLE` because it establishes connections lazily in response to
-RPCs. It uses a heuristic and reports `TRANSIENT_FAILURE` when at least two
-child policies are in `TRANSIENT_FAILURE` and none are `READY`.  This heuristic
-is an attempt to balance the need to allow the `priority` policy (which would be
-an ancestor to this LB policy in the tree of LB policies used in xDS use-cases)
-to quickly failover to the next priority and the desire to avoid reporting the
-entire policy as having failed when the problem is just one individual child
-policy that happens to be unreachable.
+Unlike most other LB policies, this policy establishes connections lazily in
+response to RPCs. While it waits for the first result from the
+`AutoshardingClient`, and until at least one endpoint has moved out of `IDLE`,
+it reports `CONNECTING` instead of applying the rules above. See [Initial
+connection behavior](#initial-connection-behavior). After that, the rules above
+apply, and the policy may report `IDLE` (for example, when all connections go
+idle). The policy uses a heuristic and reports `TRANSIENT_FAILURE` when at
+least two child policies are in `TRANSIENT_FAILURE` and none are `READY`. This
+heuristic is an attempt to balance the need to allow the `priority` policy
+(which would be an ancestor to this LB policy in the tree of LB policies used
+in xDS use-cases) to quickly failover to the next priority and the desire to
+avoid reporting the entire policy as having failed when the problem is just one
+individual child policy that happens to be unreachable.
 
 The specific behavior that will enable this LB policy to stop reporting
 `TRANSIENT_FAILURE` even when it is not receiving picks will be that whenever
@@ -1105,7 +1225,8 @@ attempt on. It does not matter which `IDLE` endpoint is chosen; that is left up
 to the implementation to determine. An efficient way to choose an `IDLE`
 endpoint is to keep track of the first `IDLE` endpoint while iterating through
 all endpoints to determine the aggregated connectivity state and use it
-directly.
+directly. This rule is not applied while `initial_connect_pending` is set. See
+[Initial connection behavior](#initial-connection-behavior).
 
 An alternative approach is shown in the following pseudo-code:
 
@@ -1367,6 +1488,40 @@ of our known use-cases fall into the second bucket and optimizing for that seems
 prudent. Connecting to backends lazily will work fine for the reverse-proxy case
 as well, as it will quickly wind up establishing connections to all endpoints.
 
+### Why report CONNECTING while waiting for the first connection attempt?
+
+When the `priority` LB policy is an ancestor of this policy, it starts a
+failover timer when a child is created, cancels it when the child reports
+`READY` or `IDLE`, and starts a new one when the child moves from `READY` or
+`IDLE` to `CONNECTING` (see [gRFC A56][A56]). A child that reports `IDLE` is
+considered usable, and lower priorities are deactivated.
+
+Reporting `IDLE` while waiting for the first assignment would prevent
+`priority` from failing over if the sharding service does not respond. And
+reporting `CONNECTING` while waiting, but `IDLE` once the assignment arrives,
+would cause a `CONNECTING` -> `IDLE` -> `CONNECTING` transition when the first
+pick triggers a connection attempt, which resets the failover timer and delays
+failover.
+
+We considered deciding which state to report based on whether a pick had been
+seen. But having seen a pick does not mean that RPCs are still queued when the
+assignment arrives (they may have been cancelled), so this does not avoid
+either problem.
+
+Instead, the policy continues to report `CONNECTING` until an endpoint is
+observed to have moved out of `IDLE`, and ensures that a connection attempt is
+eventually made. When the first result from the `AutoshardingClient` is
+received, RPCs that were queued are re-processed with the new picker almost
+immediately, and trigger a connection attempt to the endpoint they are routed
+to.
+
+Once the policy has reported `TRANSIENT_FAILURE`, `priority` will have cancelled
+its failover timer and failed over to a lower priority. Reporting `IDLE` after
+that (for example, when a valid assignment is received after an error) does not
+reset a running timer. It causes `priority` to switch back to this policy, the
+same way it would for a newly created policy that establishes connections
+lazily.
+
 ### Why use pre-existing assignments when moving to a new sharding service?
 
 In this [section](#interaction-between-lb-policy-and-the-autoshardingclient), we
@@ -1397,12 +1552,14 @@ In progress in C++ and Java.
 
 [A42]: A42-xds-ring-hash-lb-policy.md
 [A52]: A52-xds-custom-lb-policies.md
+[A56]: A56-priority-lb-policy.md
 [A62]: A62-pick-first.md
 [A74]: A74-xds-config-tears.md
 [A75]: A75-xds-aggregate-cluster-behavior-fixes.md
 [A78]: A78-grpc-metrics-wrr-pf-xds.md
 [A81]: A81-xds-authority-rewriting.md
 [A102]: <https://github.com/grpc/proposal/pull/510>
+[A117]: <https://github.com/grpc/proposal/pull/549>
 [A121]: <https://github.com/grpc/proposal/pull/556>
 [Autosharding]: <https://github.com/GoogleCloudPlatform/autosharding/blob/main/proto/autosharding/v1/autosharding.proto>
 [gRPC over HTTP/2]: https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
