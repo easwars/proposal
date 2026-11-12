@@ -358,9 +358,11 @@ dedicated component named the `AutoshardingClient`.
 
 The LB policy must create a new instance of the `AutoshardingClient` whenever
 the `channel_factory_key` or the `autosharding_target` field in the
-configuration changes. In the former case, it must also create a new gRPC
-channel to the sharding service using the “Channel Factory” provided to it
-before creating the `AutoshardingClient`.
+configuration changes. Every time it creates an `AutoshardingClient`, the LB
+policy obtains a gRPC channel to the sharding service from the “Channel
+Factory” provided to it (even if the `channel_factory_key` has not changed),
+and passes it to the `AutoshardingClient`. See [Creating a gRPC Channel to the
+Autosharding Service](#creating-a-grpc-channel-to-the-autosharding-service).
 
 When the `channel_factory_key` changes, the `AutoshardingClient` might be
 talking to a completely new sharding server and when the `autosharding_target`
@@ -372,7 +374,9 @@ not accept updates from the sharding server for a long time. Creating a new
 
 At creation time, the `AutoshardingClient` is passed the following:
 
-* A gRPC channel to the autosharding service.
+* A gRPC channel to the autosharding service. The `AutoshardingClient` takes
+  ownership of the channel, and releases it when the `AutoshardingClient` is
+  closed.
 * A string that uniquely identifies an assignment in the autosharding service.
   This string is derived from the `autosharding_target` field of the LB policy
   configuration. If a `%s` token was present in configuration field, the LB
@@ -795,50 +799,39 @@ def handle_name_resolver_update(
     self.update_state_and_picker()
     return BAD_RESOLVER_STATE
 
-  # Reuse the existing gRPC channel unless channel_factory_key has changed.
-  channel = self.grpc_channel
-  create_new_autosharding_client = False
-  new_grpc_channel_created = False
+  # Construct the autosharding target, with "%s" Locality substitution.
+  locality = get_locality_from_resolver_state(state)
+  new_target = config.autosharding_target.replace("%s", locality, 1)
 
+  # Determine if we need to recreate the AutoshardingClient.
   if (
       self.autosharding_client is None
       or config.channel_factory_key != self.config.channel_factory_key
+      or new_target != self.autosharding_target
   ):
     # Fail if no channel factory in resolver state attributes.
     channel_factory = get_channel_factory_from_resolver_state(state)
     if channel_factory is None:
+      self.close_autosharding_client()
       self.resolver_error = Error("no channel factory in resolver state")
       self.update_state_and_picker()
       return BAD_RESOLVER_STATE
 
-    # Depending on the language, channel_factory may either return a LameChannel
-    # directly on failure (e.g., C++) or return an error that the LB policy
-    # wraps in a LameChannel (e.g., Go).
+    # Get a channel. This might just result in a new reference to an existing
+    # channel. Depending on the language, channel_factory may either return a
+    # LameChannel directly on failure (e.g., C++) or return an error that the
+    # LB policy wraps in a LameChannel (e.g., Go).
     channel, err = channel_factory(config.channel_factory_key)
     if err is not None:
       channel = LameChannel(err)
-    create_new_autosharding_client = True
-    new_grpc_channel_created = True
 
-  # If autosharding_target in config has changed (taking "%s" Locality
-  # substitution into account), ensure a new AutoshardingClient is created.
-  locality = get_locality_from_resolver_state(state)
-  new_target = config.autosharding_target.replace("%s", locality, 1)
-  if self.autosharding_client is None or new_target != self.autosharding_target:
-    create_new_autosharding_client = True
-
-  # Create the new AutoshardingClient first, then close the previous client,
-  # and only then close the previous gRPC channel so no active client ever
-  # references a closed channel.
-  if create_new_autosharding_client:
+    # Create the new AutoshardingClient, which takes ownership of the channel,
+    # before closing the previous one, so that a channel shared by the two is
+    # not torn down in between.
     new_client = self.create_new_autosharding_client(channel, new_target, config)
-    self.close_previous_autosharding_client()
+    self.close_autosharding_client()
     self.autosharding_client = new_client
     self.autosharding_target = new_target
-
-  if new_grpc_channel_created:
-    self.close_previous_grpc_channel()
-    self.grpc_channel = channel
 
   # Update cached copy of the configuration before building the new Picker.
   self.config = config
@@ -977,6 +970,15 @@ creation fails for any other reason, the “Channel Factory” must indicate thi
 failure to the LB policy. Depending on the language, the factory may either
 return an error directly (as in Go) or return a "lame" channel that fails all
 RPCs with an appropriate status message (as in C++).
+
+The LB policy does not store the channel. It obtains a channel from the
+“Channel Factory” every time it creates a new `AutoshardingClient`, which takes
+ownership of the channel and releases it when closed. To avoid creating
+duplicate channels (for example, when an xDS update moves a locality to a
+different priority, which results in the LB policy being recreated), the
+“Channel Factory” should return a new reference to an existing channel when
+asked for a key for which it already has a channel with outstanding references,
+and destroy the channel only once all references have been released.
 
 In xDS-based deployments, this “Channel Factory” will be injected by the
 `cds_experimental` LB policy. Refer to section [Changes to CDS LB
@@ -1414,6 +1416,10 @@ GrpcServices, it must create a new "Channel Factory" that is capable of creating
 gRPC channels to the external services specified in the map. The newly created
 "Channel Factory" must then be injected as a resolver state attribute and passed
 down to the child policies.
+
+The “Channel Factory” created by the `cds_experimental` LB policy must return
+references to a single reference-counted channel for each key, so that LB
+policies that are recreated underneath it reuse the existing channel.
 
 Post [gRFC A75][A75], the `cds_experimental` LB policy will not perform the
 above mentioned steps for aggregate clusters.
