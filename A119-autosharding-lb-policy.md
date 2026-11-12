@@ -656,7 +656,10 @@ they are routed to. When the timer fires, if the flag is still set, the LB
 policy triggers a connection attempt to a random `IDLE` endpoint and restarts
 the timer (in case that endpoint is removed before it reports a new state). If
 a request to exit `IDLE` was seen while waiting for the result, the LB policy
-also triggers a connection attempt to a random `IDLE` endpoint immediately.
+also triggers a connection attempt to a random `IDLE` endpoint immediately. If
+a request to exit `IDLE` is received after the timer has been started, the LB
+policy does not wait for the timer to fire. See [Handling requests to exit
+IDLE](#handling-requests-to-exit-idle).
 
 ```python
 def maybe_start_initial_connect(self, first_result: bool):
@@ -666,7 +669,24 @@ def maybe_start_initial_connect(self, first_result: bool):
       self.connect_to_random_idle_endpoint()
     self.start_initial_connect_timer()
 
+def start_initial_connect_timer(self):
+  # Stop the existing timer (if any) before starting a new one, so that at most
+  # one timer is running at any time.
+  self.cancel_initial_connect_timer()
+  self.initial_connect_timer = start_timer(500ms, self.on_initial_connect_timer)
+
+def cancel_initial_connect_timer(self):
+  # Implementations must ensure that the callback of a cancelled timer does
+  # nothing, even if the timer has already fired and its callback is pending.
+  if self.initial_connect_timer is not None:
+    self.initial_connect_timer.cancel()
+    self.initial_connect_timer = None
+
+def initial_connect_timer_running(self) -> bool:
+  return self.initial_connect_timer is not None
+
 def on_initial_connect_timer(self):
+  self.initial_connect_timer = None
   if self.initial_connect_pending:
     self.connect_to_random_idle_endpoint()
     self.start_initial_connect_timer()
@@ -939,11 +959,16 @@ calls `channel.GetState(try_to_connect=true)`. In line with the behavior
 specified for `ring_hash` in [gRFC A117][A117], the LB policy handles such a
 request as follows:
 
-* If `initial_connect_pending` is set, the LB policy records that it saw the
-  request. If no result has been received from the `AutoshardingClient` yet,
-  this causes a connection attempt to be triggered as soon as the first usable
+* If `initial_connect_pending` is set and no result has been received from the
+  `AutoshardingClient` yet, the LB policy records that it saw the request. This
+  causes a connection attempt to be triggered as soon as the first usable
   result is received. See [Initial connection
   behavior](#initial-connection-behavior).
+* If `initial_connect_pending` is set and the initial connect timer is running
+  (i.e., the first usable result has been received), the LB policy immediately
+  triggers a connection attempt to an `IDLE` endpoint chosen at random, and
+  restarts the timer (in case that endpoint is removed before it reports a new
+  state).
 * If the most recently reported state is `IDLE`, the LB policy triggers a
   connection attempt to an `IDLE` endpoint chosen at random.
 * Otherwise, the request is ignored.
@@ -951,7 +976,11 @@ request as follows:
 ```python
 def exit_idle(self):
   if self.initial_connect_pending:
-    self.seen_exit_idle = True
+    if self.initial_connect_timer_running():
+      self.connect_to_random_idle_endpoint()
+      self.start_initial_connect_timer()
+    else:
+      self.seen_exit_idle = True
   if self.current_state == IDLE:
     self.connect_to_random_idle_endpoint()
 ```
