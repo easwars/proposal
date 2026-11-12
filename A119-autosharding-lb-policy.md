@@ -622,85 +622,6 @@ configuration. This is handled by propagating a `fallback_disabled` flag from
 the `AutoshardingClient` all the way to the picker, and is described in detail
 in sections on [fallback](#fallback-mechanism) and on the [Picker](#the-picker).
 
-### Initial connection behavior
-
-Because this LB policy creates connections lazily, all endpoints are `IDLE`
-when the first result is received from the `AutoshardingClient`. The
-[aggregation rules](#aggregated-connectivity-state) would therefore cause the
-LB policy to transition from `CONNECTING` to `IDLE`, and then back to
-`CONNECTING` once a pick triggers a connection attempt. When the `priority` LB
-policy is an ancestor of this policy, reporting `IDLE` cancels its failover
-timer, and moving back to `CONNECTING` starts a new one. This effectively
-extends the time it takes to fail over to a lower priority.
-
-To avoid this, the LB policy maintains an `initial_connect_pending` flag. The
-flag is set when the LB policy is created and is cleared when either of the
-following happens:
-
-* The LB policy observes that at least one endpoint has moved out of `IDLE`.
-  The flag must be cleared only when a state update from a child policy shows
-  this, not when the LB policy requests a connection, because some
-  implementations request connections asynchronously.
-* The LB policy reports `TRANSIENT_FAILURE`. After this, the `priority` LB
-  policy will have cancelled its failover timer, and reporting `IDLE` later is
-  harmless.
-
-When `initial_connect_pending` is set and a result is available from the
-`AutoshardingClient`, the LB policy reports `CONNECTING` instead of the
-aggregated state, and does not apply the proactive connection rule from the
-[Aggregated Connectivity State](#aggregated-connectivity-state) section.
-
-When the first usable result (a valid assignment, or an error with fallback
-enabled) is received while the flag is set, the LB policy starts a 500ms timer
-to give queued RPCs a chance to trigger a connection attempt to the endpoint
-they are routed to. When the timer fires, if the flag is still set, the LB
-policy triggers a connection attempt to a random `IDLE` endpoint and restarts
-the timer (in case that endpoint is removed before it reports a new state). If
-a request to exit `IDLE` was seen while waiting for the result, the LB policy
-also triggers a connection attempt to a random `IDLE` endpoint immediately. If
-a request to exit `IDLE` is received after the timer has been started, the LB
-policy does not wait for the timer to fire. See [Handling requests to exit
-IDLE](#handling-requests-to-exit-idle).
-
-The pseudo-code for `connect_to_random_idle_endpoint()` is shown in the
-[Aggregated Connectivity State](#aggregated-connectivity-state) section.
-
-```python
-def maybe_start_initial_connect(self):
-  usable = not self.assignment.is_error() or self.config.enable_fallback
-  if usable and self.initial_connect_pending:
-    if self.seen_exit_idle:
-      self.connect_to_random_idle_endpoint()
-    self.start_initial_connect_timer()
-
-def start_initial_connect_timer(self):
-  # Stop the existing timer (if any) before starting a new one, so that at most
-  # one timer is running at any time.
-  self.cancel_initial_connect_timer()
-  self.initial_connect_timer = start_timer(500ms, self.on_initial_connect_timer)
-
-def cancel_initial_connect_timer(self):
-  # Implementations must ensure that the callback of a cancelled timer does
-  # nothing, even if the timer has already fired and its callback is pending.
-  if self.initial_connect_timer is not None:
-    self.initial_connect_timer.cancel()
-    self.initial_connect_timer = None
-
-def initial_connect_timer_running(self) -> bool:
-  return self.initial_connect_timer is not None
-
-def on_initial_connect_timer(self):
-  self.initial_connect_timer = None
-  if self.initial_connect_pending:
-    self.connect_to_random_idle_endpoint()
-    self.start_initial_connect_timer()
-
-def clear_initial_connect(self):
-  self.initial_connect_pending = False
-  self.seen_exit_idle = False
-  self.cancel_initial_connect_timer()
-```
-
 ### Fallback Mechanism
 
 The LB policy must support a fallback mechanism that utilizes all endpoints
@@ -798,6 +719,247 @@ the "Channel Factory".
   plane, following the security framework established in [gRFC A102][A102].
 * Per-request gRPC metadata for the sharding service is omitted from the
   configuration.
+
+### Interactions with `pick_first`
+
+The LB policy will not proactively connect to endpoints given to it by the Name
+Resolver. Instead, connections are triggered from the picker as described in
+the [picker](#the-picker) pseudo-code below, except in the cases described in
+[Initial connection behavior](#initial-connection-behavior), [Handling requests
+to exit IDLE](#handling-requests-to-exit-idle), and [Aggregated Connectivity
+State](#aggregated-connectivity-state).
+
+`autosharding_experimental` must create a `pick_first` child for every endpoint
+given to it by the Name Resolver.  `pick_first` starts connecting as soon as it
+is given its endpoint. So, `autosharding_experimental` must make sure that the
+child `pick_first` policy is created lazily, when a connection to that endpoint
+needs to be established. This may be accomplished by wrapping `pick_first` in a
+parent policy that creates `pick_first` only when asked to establish a
+connection.
+
+The `autosharding_experimental` LB policy also relies on the sticky-TF behavior
+(specified in [gRFC A62][A62]) implemented by the `pick_first` policy, that
+ensures endpoints in `TRANSIENT_FAILURE` stay in that state and continuously try
+to reconnect with exponential backoff until they become `READY`.
+
+### Aggregated Connectivity State
+
+The LB policy will use the same rules used by the `ring_hash` LB policy, as
+described in [gRFC A42][A42] to determine the aggregated connectivity state of
+the gRPC Channel. Children in pending-creation state are considered `IDLE` for
+these rules. The complete connectivity state aggregation rules are as follows:
+
+1. If there is at least one child policy in `READY` state, report `READY`.
+2. If there are 2 or more children in `TRANSIENT_FAILURE` state, report
+   `TRANSIENT_FAILURE`.
+3. If there is at least one child in `CONNECTING` state, report `CONNECTING`.
+4. If there is one child in `TRANSIENT_FAILURE` and there is more than one
+   child, report state `CONNECTING`.
+5. If there is at least one child in `IDLE` state, report `IDLE`.
+6. Otherwise, report `TRANSIENT_FAILURE`.
+
+Unlike most other LB policies, this policy establishes connections lazily in
+response to RPCs. While it waits for the first result from the
+`AutoshardingClient`, and until at least one endpoint has moved out of `IDLE`,
+it reports `CONNECTING` instead of applying the rules above. See [Initial
+connection behavior](#initial-connection-behavior). After that, the rules above
+apply, and the policy may report `IDLE` (for example, when all connections go
+idle). The policy uses a heuristic and reports `TRANSIENT_FAILURE` when at
+least two child policies are in `TRANSIENT_FAILURE` and none are `READY`. This
+heuristic is an attempt to balance the need to allow the `priority` policy
+(which would be an ancestor to this LB policy in the tree of LB policies used
+in xDS use-cases) to quickly failover to the next priority and the desire to
+avoid reporting the entire policy as having failed when the problem is just one
+individual child policy that happens to be unreachable.
+
+The specific behavior that will enable this LB policy to stop reporting
+`TRANSIENT_FAILURE` even when it is not receiving picks will be that whenever
+this policy receives a connectivity state update from one of its children or a
+resolver update, if the aggregated connectivity state is `TRANSIENT_FAILURE` or
+`CONNECTING` and there are no endpoints in `CONNECTING` state, the policy will
+choose one of the endpoints in `IDLE` state (if any) at random to trigger a
+connection attempt on. Choosing the endpoint at random ensures that load is
+distributed evenly across backends when many clients trigger connection
+attempts at the same time, in line with the behavior specified for `ring_hash`
+in [gRFC A117][A117]. This rule is not applied while `initial_connect_pending`
+is set. See [Initial connection behavior](#initial-connection-behavior).
+
+The same function is used to trigger connection attempts that are not caused
+by picks in [Initial connection behavior](#initial-connection-behavior) and
+[Handling requests to exit IDLE](#handling-requests-to-exit-idle).
+
+```python
+# Triggers a connection attempt to a random IDLE endpoint, unless a connection
+# attempt is already in progress.
+def connect_to_random_idle_endpoint(self):
+  idle_endpoints = []
+  for endpoint in self.endpoint_map.m.values():
+    if endpoint.state == CONNECTING:
+      return
+    if endpoint.state == IDLE:
+      idle_endpoints.append(endpoint)
+  if idle_endpoints:
+    random.choice(idle_endpoints).request_connection()
+```
+
+### Handling updates from child policies
+
+When the LB policy receives a state update from one of its child policies
+containing the new connectivity state and picker for the child policy, it
+updates the `EndpointState` that owns that child policy and invokes
+`update_state_and_picker()` (shown in the [Handling updates from the Name
+Resolver](#handling-updates-from-the-name-resolver) section below).
+
+Implementations must not identify the `EndpointState` to update by looking up
+the endpoint's hostname in the `EndpointMap`. A Name Resolver update may have
+reassigned the hostname to a different endpoint, and the state update may be a
+lingering one from the child policy of the old endpoint. Instead:
+
+* Implementations where the child policy's callbacks hold a direct reference to
+  the `EndpointState` (as in the pseudo-code below) must ignore updates for an
+  `EndpointState` that has been removed.
+* Implementations that receive child state updates tagged with an identifier
+  must look up the `EndpointState` using the same identity that was used to
+  create the child policy, and must ignore updates for which no such
+  `EndpointState` exists. For example, in Go, the `endpointsharding` LB policy
+  reports per-child state along with the child's endpoint, and the
+  `EndpointState` is looked up using the set of addresses in that endpoint.
+
+```python
+def handle_child_policy_update(
+    self, es: EndpointState, new_state: ConnectivityState, new_picker: Picker
+):
+  # Ignore lingering updates from the child policy of a removed endpoint.
+  if es.removed:
+    return
+  es.state = new_state
+  es.picker = new_picker
+
+  # Once any endpoint moves out of IDLE, the aggregation rules can no longer
+  # result in IDLE. See "Initial connection behavior".
+  if self.initial_connect_pending and any(
+      e.state != IDLE for e in self.endpoint_map.m.values()
+  ):
+    self.clear_initial_connect()
+
+  self.update_state_and_picker()
+```
+
+Note that since the order or number of endpoints did not change as part of a
+child policy state update, the existing `SliceMap` should be reused when
+building a new `Picker`.
+
+### Initial connection behavior
+
+Because this LB policy creates connections lazily, all endpoints are `IDLE`
+when the first result is received from the `AutoshardingClient`. The
+[aggregation rules](#aggregated-connectivity-state) would therefore cause the
+LB policy to transition from `CONNECTING` to `IDLE`, and then back to
+`CONNECTING` once a pick triggers a connection attempt. When the `priority` LB
+policy is an ancestor of this policy, reporting `IDLE` cancels its failover
+timer, and moving back to `CONNECTING` starts a new one. This effectively
+extends the time it takes to fail over to a lower priority.
+
+To avoid this, the LB policy maintains an `initial_connect_pending` flag. The
+flag is set when the LB policy is created and is cleared when either of the
+following happens:
+
+* The LB policy observes that at least one endpoint has moved out of `IDLE`.
+  The flag must be cleared only when a state update from a child policy shows
+  this, not when the LB policy requests a connection, because some
+  implementations request connections asynchronously.
+* The LB policy reports `TRANSIENT_FAILURE`. After this, the `priority` LB
+  policy will have cancelled its failover timer, and reporting `IDLE` later is
+  harmless.
+
+When `initial_connect_pending` is set and a result is available from the
+`AutoshardingClient`, the LB policy reports `CONNECTING` instead of the
+aggregated state, and does not apply the proactive connection rule from the
+[Aggregated Connectivity State](#aggregated-connectivity-state) section.
+
+When the first usable result (a valid assignment, or an error with fallback
+enabled) is received while the flag is set, the LB policy starts a 500ms timer
+to give queued RPCs a chance to trigger a connection attempt to the endpoint
+they are routed to. When the timer fires, if the flag is still set, the LB
+policy triggers a connection attempt to a random `IDLE` endpoint and restarts
+the timer (in case that endpoint is removed before it reports a new state). If
+a request to exit `IDLE` was seen while waiting for the result, the LB policy
+also triggers a connection attempt to a random `IDLE` endpoint immediately. If
+a request to exit `IDLE` is received after the timer has been started, the LB
+policy does not wait for the timer to fire. See [Handling requests to exit
+IDLE](#handling-requests-to-exit-idle).
+
+The pseudo-code for `connect_to_random_idle_endpoint()` is shown in the
+[Aggregated Connectivity State](#aggregated-connectivity-state) section.
+
+```python
+def maybe_start_initial_connect(self):
+  usable = not self.assignment.is_error() or self.config.enable_fallback
+  if usable and self.initial_connect_pending:
+    if self.seen_exit_idle:
+      self.connect_to_random_idle_endpoint()
+    self.start_initial_connect_timer()
+
+def start_initial_connect_timer(self):
+  # Stop the existing timer (if any) before starting a new one, so that at most
+  # one timer is running at any time.
+  self.cancel_initial_connect_timer()
+  self.initial_connect_timer = start_timer(500ms, self.on_initial_connect_timer)
+
+def cancel_initial_connect_timer(self):
+  # Implementations must ensure that the callback of a cancelled timer does
+  # nothing, even if the timer has already fired and its callback is pending.
+  if self.initial_connect_timer is not None:
+    self.initial_connect_timer.cancel()
+    self.initial_connect_timer = None
+
+def initial_connect_timer_running(self) -> bool:
+  return self.initial_connect_timer is not None
+
+def on_initial_connect_timer(self):
+  self.initial_connect_timer = None
+  if self.initial_connect_pending:
+    self.connect_to_random_idle_endpoint()
+    self.start_initial_connect_timer()
+
+def clear_initial_connect(self):
+  self.initial_connect_pending = False
+  self.seen_exit_idle = False
+  self.cancel_initial_connect_timer()
+```
+
+### Handling requests to exit IDLE
+
+The channel asks the LB policy to exit `IDLE` when, for example, the application
+calls `channel.GetState(try_to_connect=true)`. In line with the behavior
+specified for `ring_hash` in [gRFC A117][A117], the LB policy handles such a
+request as follows:
+
+* If `initial_connect_pending` is set and no result has been received from the
+  `AutoshardingClient` yet, the LB policy records that it saw the request. This
+  causes a connection attempt to be triggered as soon as the first usable
+  result is received. See [Initial connection
+  behavior](#initial-connection-behavior).
+* If `initial_connect_pending` is set and the initial connect timer is running
+  (i.e., the first usable result has been received), the LB policy immediately
+  triggers a connection attempt to an `IDLE` endpoint chosen at random, and
+  restarts the timer (in case that endpoint is removed before it reports a new
+  state).
+* If the most recently reported state is `IDLE`, the LB policy triggers a
+  connection attempt to an `IDLE` endpoint chosen at random.
+* Otherwise, the request is ignored.
+
+```python
+def exit_idle(self):
+  if self.initial_connect_pending:
+    if self.initial_connect_timer_running():
+      self.connect_to_random_idle_endpoint()
+      self.start_initial_connect_timer()
+    else:
+      self.seen_exit_idle = True
+  if self.current_state == IDLE:
+    self.connect_to_random_idle_endpoint()
+```
 
 ### Handling updates from the Name Resolver
 
@@ -904,169 +1066,6 @@ def update_state_and_picker(self):
   picker = self.build_picker()
   self.update_channel_state(agg_state, picker)
 ```
-
-### Handling updates from child policies
-
-When the LB policy receives a state update from one of its child policies
-containing the new connectivity state and picker for the child policy, it
-updates the `EndpointState` that owns that child policy and invokes
-`update_state_and_picker()` (shown in the [Handling updates from the Name
-Resolver](#handling-updates-from-the-name-resolver) section above).
-
-Implementations must not identify the `EndpointState` to update by looking up
-the endpoint's hostname in the `EndpointMap`. A Name Resolver update may have
-reassigned the hostname to a different endpoint, and the state update may be a
-lingering one from the child policy of the old endpoint. Instead:
-
-* Implementations where the child policy's callbacks hold a direct reference to
-  the `EndpointState` (as in the pseudo-code below) must ignore updates for an
-  `EndpointState` that has been removed.
-* Implementations that receive child state updates tagged with an identifier
-  must look up the `EndpointState` using the same identity that was used to
-  create the child policy, and must ignore updates for which no such
-  `EndpointState` exists. For example, in Go, the `endpointsharding` LB policy
-  reports per-child state along with the child's endpoint, and the
-  `EndpointState` is looked up using the set of addresses in that endpoint.
-
-```python
-def handle_child_policy_update(
-    self, es: EndpointState, new_state: ConnectivityState, new_picker: Picker
-):
-  # Ignore lingering updates from the child policy of a removed endpoint.
-  if es.removed:
-    return
-  es.state = new_state
-  es.picker = new_picker
-
-  # Once any endpoint moves out of IDLE, the aggregation rules can no longer
-  # result in IDLE. See "Initial connection behavior".
-  if self.initial_connect_pending and any(
-      e.state != IDLE for e in self.endpoint_map.m.values()
-  ):
-    self.clear_initial_connect()
-
-  self.update_state_and_picker()
-```
-
-Note that since the order or number of endpoints did not change as part of a
-child policy state update, the existing `SliceMap` should be reused when
-building a new `Picker`.
-
-### Handling requests to exit IDLE
-
-The channel asks the LB policy to exit `IDLE` when, for example, the application
-calls `channel.GetState(try_to_connect=true)`. In line with the behavior
-specified for `ring_hash` in [gRFC A117][A117], the LB policy handles such a
-request as follows:
-
-* If `initial_connect_pending` is set and no result has been received from the
-  `AutoshardingClient` yet, the LB policy records that it saw the request. This
-  causes a connection attempt to be triggered as soon as the first usable
-  result is received. See [Initial connection
-  behavior](#initial-connection-behavior).
-* If `initial_connect_pending` is set and the initial connect timer is running
-  (i.e., the first usable result has been received), the LB policy immediately
-  triggers a connection attempt to an `IDLE` endpoint chosen at random, and
-  restarts the timer (in case that endpoint is removed before it reports a new
-  state).
-* If the most recently reported state is `IDLE`, the LB policy triggers a
-  connection attempt to an `IDLE` endpoint chosen at random.
-* Otherwise, the request is ignored.
-
-```python
-def exit_idle(self):
-  if self.initial_connect_pending:
-    if self.initial_connect_timer_running():
-      self.connect_to_random_idle_endpoint()
-      self.start_initial_connect_timer()
-    else:
-      self.seen_exit_idle = True
-  if self.current_state == IDLE:
-    self.connect_to_random_idle_endpoint()
-```
-
-### Creating a gRPC Channel to the Autosharding Service
-
-The LB policy will be injected with a “Channel Factory” via attributes,
-alongside its configuration. This utility will help create a fully functional
-gRPC Channel given the `channel_factory_key` in the LB policy configuration.
-Implementations must ensure the key uniquely encodes all parameters necessary
-for channel creation. For example, credentials need only be included in the key
-if the factory supports creating channels with different credentials.
-
-If the `channel_factory_key` is unrecognized or disallowed, or if channel
-creation fails for any other reason, the “Channel Factory” must indicate this
-failure to the LB policy. Depending on the language, the factory may either
-return an error directly (as in Go) or return a "lame" channel that fails all
-RPCs with an appropriate status message (as in C++).
-
-The LB policy does not store the channel. It obtains a channel from the
-“Channel Factory” every time it creates a new `AutoshardingClient`, which takes
-ownership of the channel and releases it when closed. To avoid creating
-duplicate channels (for example, when an xDS update moves a locality to a
-different priority, which results in the LB policy being recreated), the
-“Channel Factory” should return a new reference to an existing channel when
-asked for a key for which it already has a channel with outstanding references,
-and destroy the channel only once all references have been released.
-
-In xDS-based deployments, this “Channel Factory” will be injected by the
-`cds_experimental` LB policy. Refer to section [Changes to CDS LB
-policy](#changes-to-cds-lb-policy) for more details. For non-xDS environments,
-users will have the capability to inject this utility via a dedicated channel
-option.
-
-#### Go
-
-The “Channel Factory” or provider is defined as a function type that accepts a
-string key, and returns a gRPC channel. The existing `grpc.ClientConnInterface`
-interface, instead of the concrete `*grpc.ClientConn` type,  is used to
-represent a gRPC channel, to allow for wrapping. The LB policy can create a
-client stub to the sharding service by passing this interface to the protobuf
-generated code and make RPCs using that client stub.
-
-```golang
-package grpc
-
-// A factory to create a grpc.ClientConn given a string. 
-//
-// The second return value is a cancel function that the caller must invoke
-// once they are done using the returned grpc.ClientConn. 
-type ClientConnProvider func(string) (ClientConnInterface, func(), error)
-```
-
-A `DialOption` will be added to allow the user to inject a “Channel Factory”.
-gRPC will take care of plumbing this down to the LB policies.
-
-```golang
-package grpc
-
-// WithClientConnProvider returns a dial option that makes the channel provider
-// available to LB policies.
-func WithClientConnProvider(f ClientConnProvider) DialOption { ... }
-```
-
-We will also have APIs to set and get this factory from the `resolver.State`
-struct that is sent to the LB policy as part of a resolver update.
-
-```golang
-package grpc
-
-// ClientConnProviderFromResolverState returns a ClientConnProvider from the
-// given resolver state, or nil if not present.
-func ClientConnProviderFromResolverState(state resolver.State) ClientConnProvider { ... }
-
-// SetClientConnProvider returns a copy of the resolver state with the provider
-// set as an attribute.
-func SetClientConnProvider(s resolver.State, p ClientConnProvider) resolver.State { ... }
-```
-
-#### C++
-
-TBD
-
-#### Java
-
-TBD
 
 ### The Picker
 
@@ -1188,87 +1187,88 @@ class Picker:
     return self.endpoints[first_ep_idx].picker.pick(pick_args)
 ```
 
-### Interactions with `pick_first`
+### Creating a gRPC Channel to the Autosharding Service
 
-The LB policy will not proactively connect to endpoints given to it by the Name
-Resolver. Instead, connections are triggered from the picker as described above
-in the picker pseudo-code, except in the cases described in [Initial connection
-behavior](#initial-connection-behavior), [Handling requests to exit
-IDLE](#handling-requests-to-exit-idle), and [Aggregated Connectivity
-State](#aggregated-connectivity-state).
+The LB policy will be injected with a “Channel Factory” via attributes,
+alongside its configuration. This utility will help create a fully functional
+gRPC Channel given the `channel_factory_key` in the LB policy configuration.
+Implementations must ensure the key uniquely encodes all parameters necessary
+for channel creation. For example, credentials need only be included in the key
+if the factory supports creating channels with different credentials.
 
-`autosharding_experimental` must create a `pick_first` child for every endpoint
-given to it by the Name Resolver.  `pick_first` starts connecting as soon as it
-is given its endpoint. So, `autosharding_experimental` must make sure that the
-child `pick_first` policy is created lazily, when a connection to that endpoint
-needs to be established. This may be accomplished by wrapping `pick_first` in a
-parent policy that creates `pick_first` only when asked to establish a
-connection.
+If the `channel_factory_key` is unrecognized or disallowed, or if channel
+creation fails for any other reason, the “Channel Factory” must indicate this
+failure to the LB policy. Depending on the language, the factory may either
+return an error directly (as in Go) or return a "lame" channel that fails all
+RPCs with an appropriate status message (as in C++).
 
-The `autosharding_experimental` LB policy also relies on the sticky-TF behavior
-(specified in [gRFC A62][A62]) implemented by the `pick_first` policy, that
-ensures endpoints in `TRANSIENT_FAILURE` stay in that state and continuously try
-to reconnect with exponential backoff until they become `READY`.
+The LB policy does not store the channel. It obtains a channel from the
+“Channel Factory” every time it creates a new `AutoshardingClient`, which takes
+ownership of the channel and releases it when closed. To avoid creating
+duplicate channels (for example, when an xDS update moves a locality to a
+different priority, which results in the LB policy being recreated), the
+“Channel Factory” should return a new reference to an existing channel when
+asked for a key for which it already has a channel with outstanding references,
+and destroy the channel only once all references have been released.
 
-### Aggregated Connectivity State
+In xDS-based deployments, this “Channel Factory” will be injected by the
+`cds_experimental` LB policy. Refer to section [Changes to CDS LB
+policy](#changes-to-cds-lb-policy) for more details. For non-xDS environments,
+users will have the capability to inject this utility via a dedicated channel
+option.
 
-The LB policy will use the same rules used by the `ring_hash` LB policy, as
-described in [gRFC A42][A42] to determine the aggregated connectivity state of
-the gRPC Channel. Children in pending-creation state are considered `IDLE` for
-these rules. The complete connectivity state aggregation rules are as follows:
+#### Go
 
-1. If there is at least one child policy in `READY` state, report `READY`.
-2. If there are 2 or more children in `TRANSIENT_FAILURE` state, report
-   `TRANSIENT_FAILURE`.
-3. If there is at least one child in `CONNECTING` state, report `CONNECTING`.
-4. If there is one child in `TRANSIENT_FAILURE` and there is more than one
-   child, report state `CONNECTING`.
-5. If there is at least one child in `IDLE` state, report `IDLE`.
-6. Otherwise, report `TRANSIENT_FAILURE`.
+The “Channel Factory” or provider is defined as a function type that accepts a
+string key, and returns a gRPC channel. The existing `grpc.ClientConnInterface`
+interface, instead of the concrete `*grpc.ClientConn` type,  is used to
+represent a gRPC channel, to allow for wrapping. The LB policy can create a
+client stub to the sharding service by passing this interface to the protobuf
+generated code and make RPCs using that client stub.
 
-Unlike most other LB policies, this policy establishes connections lazily in
-response to RPCs. While it waits for the first result from the
-`AutoshardingClient`, and until at least one endpoint has moved out of `IDLE`,
-it reports `CONNECTING` instead of applying the rules above. See [Initial
-connection behavior](#initial-connection-behavior). After that, the rules above
-apply, and the policy may report `IDLE` (for example, when all connections go
-idle). The policy uses a heuristic and reports `TRANSIENT_FAILURE` when at
-least two child policies are in `TRANSIENT_FAILURE` and none are `READY`. This
-heuristic is an attempt to balance the need to allow the `priority` policy
-(which would be an ancestor to this LB policy in the tree of LB policies used
-in xDS use-cases) to quickly failover to the next priority and the desire to
-avoid reporting the entire policy as having failed when the problem is just one
-individual child policy that happens to be unreachable.
+```golang
+package grpc
 
-The specific behavior that will enable this LB policy to stop reporting
-`TRANSIENT_FAILURE` even when it is not receiving picks will be that whenever
-this policy receives a connectivity state update from one of its children or a
-resolver update, if the aggregated connectivity state is `TRANSIENT_FAILURE` or
-`CONNECTING` and there are no endpoints in `CONNECTING` state, the policy will
-choose one of the endpoints in `IDLE` state (if any) at random to trigger a
-connection attempt on. Choosing the endpoint at random ensures that load is
-distributed evenly across backends when many clients trigger connection
-attempts at the same time, in line with the behavior specified for `ring_hash`
-in [gRFC A117][A117]. This rule is not applied while `initial_connect_pending`
-is set. See [Initial connection behavior](#initial-connection-behavior).
-
-The same function is used to trigger connection attempts that are not caused
-by picks in [Initial connection behavior](#initial-connection-behavior) and
-[Handling requests to exit IDLE](#handling-requests-to-exit-idle).
-
-```python
-# Triggers a connection attempt to a random IDLE endpoint, unless a connection
-# attempt is already in progress.
-def connect_to_random_idle_endpoint(self):
-  idle_endpoints = []
-  for endpoint in self.endpoint_map.m.values():
-    if endpoint.state == CONNECTING:
-      return
-    if endpoint.state == IDLE:
-      idle_endpoints.append(endpoint)
-  if idle_endpoints:
-    random.choice(idle_endpoints).request_connection()
+// A factory to create a grpc.ClientConn given a string. 
+//
+// The second return value is a cancel function that the caller must invoke
+// once they are done using the returned grpc.ClientConn. 
+type ClientConnProvider func(string) (ClientConnInterface, func(), error)
 ```
+
+A `DialOption` will be added to allow the user to inject a “Channel Factory”.
+gRPC will take care of plumbing this down to the LB policies.
+
+```golang
+package grpc
+
+// WithClientConnProvider returns a dial option that makes the channel provider
+// available to LB policies.
+func WithClientConnProvider(f ClientConnProvider) DialOption { ... }
+```
+
+We will also have APIs to set and get this factory from the `resolver.State`
+struct that is sent to the LB policy as part of a resolver update.
+
+```golang
+package grpc
+
+// ClientConnProviderFromResolverState returns a ClientConnProvider from the
+// given resolver state, or nil if not present.
+func ClientConnProviderFromResolverState(state resolver.State) ClientConnProvider { ... }
+
+// SetClientConnProvider returns a copy of the resolver state with the provider
+// set as an attribute.
+func SetClientConnProvider(s resolver.State, p ClientConnProvider) resolver.State { ... }
+```
+
+#### C++
+
+TBD
+
+#### Java
+
+TBD
 
 ### xDS integration
 
