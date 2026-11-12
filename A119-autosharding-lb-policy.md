@@ -482,7 +482,8 @@ def on_assignment_update(self, assignment: Assignment | Error):
   first_result = self.assignment is None
   self.assignment = assignment
   self.slice_map = build_slice_map(self.endpoint_map, self.assignment)
-  self.maybe_start_initial_connect(first_result)
+  if first_result:
+    self.maybe_start_initial_connect()
   self.update_state_and_picker()
 ```
 
@@ -661,10 +662,13 @@ a request to exit `IDLE` is received after the timer has been started, the LB
 policy does not wait for the timer to fire. See [Handling requests to exit
 IDLE](#handling-requests-to-exit-idle).
 
+The pseudo-code for `connect_to_random_idle_endpoint()` is shown in the
+[Aggregated Connectivity State](#aggregated-connectivity-state) section.
+
 ```python
-def maybe_start_initial_connect(self, first_result: bool):
+def maybe_start_initial_connect(self):
   usable = not self.assignment.is_error() or self.config.enable_fallback
-  if first_result and usable and self.initial_connect_pending:
+  if usable and self.initial_connect_pending:
     if self.seen_exit_idle:
       self.connect_to_random_idle_endpoint()
     self.start_initial_connect_timer()
@@ -890,15 +894,11 @@ def update_state_and_picker(self):
   # Compute the channel's aggregated connectivity state.
   agg_state = self.compute_aggregated_connectivity_state()
 
-  # If aggregated state is TRANSIENT_FAILURE or CONNECTING and there are no
-  # endpoints in CONNECTING, request a connection on an IDLE endpoint (if any).
-  if (
-      agg_state in (TRANSIENT_FAILURE, CONNECTING)
-      and not self.has_connecting_endpoint()
-  ):
-    idle_endpoint = self.first_idle_endpoint()
-    if idle_endpoint is not None:
-      idle_endpoint.request_connection()
+  # If aggregated state is TRANSIENT_FAILURE or CONNECTING, request a connection
+  # on a random IDLE endpoint (if any), unless an endpoint is already
+  # CONNECTING. See "Aggregated Connectivity State".
+  if agg_state in (TRANSIENT_FAILURE, CONNECTING):
+    self.connect_to_random_idle_endpoint()
 
   # Build new picker and update the channel.
   picker = self.build_picker()
@@ -1245,29 +1245,29 @@ The specific behavior that will enable this LB policy to stop reporting
 this policy receives a connectivity state update from one of its children or a
 resolver update, if the aggregated connectivity state is `TRANSIENT_FAILURE` or
 `CONNECTING` and there are no endpoints in `CONNECTING` state, the policy will
-choose one of the endpoints in `IDLE` state (if any) to trigger a connection
-attempt on. It does not matter which `IDLE` endpoint is chosen; that is left up
-to the implementation to determine. An efficient way to choose an `IDLE`
-endpoint is to keep track of the first `IDLE` endpoint while iterating through
-all endpoints to determine the aggregated connectivity state and use it
-directly. This rule is not applied while `initial_connect_pending` is set. See
-[Initial connection behavior](#initial-connection-behavior).
+choose one of the endpoints in `IDLE` state (if any) at random to trigger a
+connection attempt on. Choosing the endpoint at random ensures that load is
+distributed evenly across backends when many clients trigger connection
+attempts at the same time, in line with the behavior specified for `ring_hash`
+in [gRFC A117][A117]. This rule is not applied while `initial_connect_pending`
+is set. See [Initial connection behavior](#initial-connection-behavior).
 
-An alternative approach is shown in the following pseudo-code:
+The same function is used to trigger connection attempts that are not caused
+by picks in [Initial connection behavior](#initial-connection-behavior) and
+[Handling requests to exit IDLE](#handling-requests-to-exit-idle).
 
 ```python
-if aggregated_state in (CONNECTING, TRANSIENT_FAILURE):
-  first_idle = None
-
-  for endpoint in endpoints:
+# Triggers a connection attempt to a random IDLE endpoint, unless a connection
+# attempt is already in progress.
+def connect_to_random_idle_endpoint(self):
+  idle_endpoints = []
+  for endpoint in self.endpoint_map.m.values():
     if endpoint.state == CONNECTING:
-      first_idle = None
-      break
-    if first_idle is None and endpoint.state == IDLE:
-      first_idle = endpoint
-
-  if first_idle is not None:
-    first_idle.request_connection()
+      return
+    if endpoint.state == IDLE:
+      idle_endpoints.append(endpoint)
+  if idle_endpoints:
+    random.choice(idle_endpoints).request_connection()
 ```
 
 ### xDS integration
