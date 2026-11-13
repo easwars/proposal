@@ -385,9 +385,7 @@ At creation time, the `AutoshardingClient` is passed the following:
   string if that attribute is not present. The LB policy applies this rule
   regardless of the mode it is being used in (see [Supported modes of
   operation](#supported-modes-of-operation)), and does not need to know which
-  mode that is. It is the responsibility of whoever generates the LB policy
-  configuration to only use a `%s` token when the “Locality” attribute is
-  expected to be present.
+  mode that is.
   * In xDS use-cases, the “Locality” attribute is set by the
     `weighted_target_experimental` LB policy to the name of its child (which is
     the string representation of the xDS locality, as specified in the [Optional
@@ -397,13 +395,9 @@ At creation time, the `AutoshardingClient` is passed the following:
     it. So, the attribute is present when the `autosharding_experimental` LB
     policy is used for endpoint picking alone (underneath
     `weighted_target_experimental`), and is absent when it is used for both
-    locality and endpoint picking, in which case the `autosharding_target` field
-    is not expected to contain a `%s` token, since the policy handles endpoints
-    from all localities.
+    locality and endpoint picking.
   * In non-xDS use-cases, the `autosharding_target` field is typically not
-    expected to contain a `%s` token. If it does, it is the responsibility of
-    the user to ensure that the “Locality” attribute is populated by the Name
-    Resolver.
+    expected to contain a `%s` token.
 * A UUID created by the LB policy at build time. The `AutoshardingClient` must
   reuse this value across stream restarts.
 * A timeout that determines how long to wait for an initial result (a valid
@@ -1037,9 +1031,9 @@ request as follows:
   behavior](#initial-connection-behavior).
 * If `initial_connect_pending` is set and the initial connect timer is running
   (i.e., the first usable result has been received), the LB policy immediately
-  triggers a connection attempt to an `IDLE` endpoint chosen at random, and
-  restarts the timer (in case that endpoint is removed before it reports a new
-  state).
+  triggers a connection attempt to an `IDLE` endpoint chosen at random. The
+  timer is left running, in case that endpoint is removed before it reports a
+  new state.
 * If the most recently reported state is `IDLE`, the LB policy triggers a
   connection attempt to an `IDLE` endpoint chosen at random.
 * Otherwise, the request is ignored.
@@ -1049,12 +1043,11 @@ def exit_idle(self):
   if self.initial_connect_pending:
     if self.initial_connect_timer_running():
       self.connect_to_random_idle_endpoint()
-      self.start_initial_connect_timer()
     else:
       self.seen_exit_idle = True
   # current_state is the state most recently reported via
   # update_channel_state().
-  if self.current_state == IDLE:
+  elif self.current_state == IDLE:
     self.connect_to_random_idle_endpoint()
 ```
 
