@@ -772,6 +772,34 @@ in xDS use-cases) to quickly failover to the next priority and the desire to
 avoid reporting the entire policy as having failed when the problem is just one
 individual child policy that happens to be unreachable.
 
+The aggregated connectivity state is computed as shown in the following
+pseudo-code. Since it already iterates over all endpoints, this is also where
+`initial_connect_pending` is cleared once any endpoint has moved out of `IDLE`.
+
+```python
+def compute_aggregated_connectivity_state(self) -> ConnectivityState:
+  counts = {READY: 0, CONNECTING: 0, IDLE: 0, TRANSIENT_FAILURE: 0}
+  for endpoint in self.endpoint_map.m.values():
+    counts[endpoint.state] += 1
+
+  # Once any endpoint has moved out of IDLE, the aggregated state can no longer
+  # be IDLE. See "Initial connection behavior".
+  if self.initial_connect_pending and counts[IDLE] != len(self.endpoint_map.m):
+    self.clear_initial_connect()
+
+  if counts[READY] > 0:
+    return READY
+  if counts[TRANSIENT_FAILURE] >= 2:
+    return TRANSIENT_FAILURE
+  if counts[CONNECTING] > 0:
+    return CONNECTING
+  if counts[TRANSIENT_FAILURE] == 1 and len(self.endpoint_map.m) > 1:
+    return CONNECTING
+  if counts[IDLE] > 0:
+    return IDLE
+  return TRANSIENT_FAILURE
+```
+
 The specific behavior that will enable this LB policy to stop reporting
 `TRANSIENT_FAILURE` even when it is not receiving picks will be that whenever
 this policy receives a connectivity state update from one of its children or a
@@ -834,14 +862,6 @@ def handle_child_policy_update(
     return
   es.state = new_state
   es.picker = new_picker
-
-  # Once any endpoint moves out of IDLE, the aggregation rules can no longer
-  # result in IDLE. See "Initial connection behavior".
-  if self.initial_connect_pending and any(
-      e.state != IDLE for e in self.endpoint_map.m.values()
-  ):
-    self.clear_initial_connect()
-
   self.update_state_and_picker()
 ```
 
@@ -864,10 +884,13 @@ To avoid this, the LB policy maintains an `initial_connect_pending` flag. The
 flag is set when the LB policy is created and is cleared when either of the
 following happens:
 
-* The LB policy observes that at least one endpoint has moved out of `IDLE`.
-  The flag must be cleared only when a state update from a child policy shows
-  this, not when the LB policy requests a connection, because some
-  implementations request connections asynchronously.
+* The LB policy observes that at least one endpoint has moved out of `IDLE`,
+  when computing the aggregated connectivity state (see
+  `compute_aggregated_connectivity_state()` in the [Aggregated Connectivity
+  State](#aggregated-connectivity-state) section). The flag must be cleared
+  only based on the state reported by the child policies, not when the LB
+  policy requests a connection, because some implementations request
+  connections asynchronously.
 * The LB policy reports `TRANSIENT_FAILURE`. After this, the `priority` LB
   policy will have cancelled its failover timer, and reporting `IDLE` later is
   harmless.
@@ -1046,15 +1069,16 @@ def update_state_and_picker(self):
     )
     return
 
-  # If no endpoint has moved out of IDLE yet, report CONNECTING instead of the
-  # aggregated state, and do not proactively trigger connection attempts. See
-  # "Initial connection behavior".
-  if self.initial_connect_pending:
+  # Compute the channel's aggregated connectivity state. This also clears
+  # initial_connect_pending when the first endpoint moves out of IDLE.
+  agg_state = self.compute_aggregated_connectivity_state()
+
+  # If no endpoint has moved out of IDLE yet, report CONNECTING instead of IDLE,
+  # and do not proactively trigger connection attempts. See "Initial connection
+  # behavior".
+  if agg_state == IDLE and self.initial_connect_pending:
     self.update_channel_state(CONNECTING, self.build_picker())
     return
-
-  # Compute the channel's aggregated connectivity state.
-  agg_state = self.compute_aggregated_connectivity_state()
 
   # If aggregated state is TRANSIENT_FAILURE or CONNECTING, request a connection
   # on a random IDLE endpoint (if any), unless an endpoint is already
