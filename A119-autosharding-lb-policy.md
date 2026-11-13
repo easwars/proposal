@@ -243,15 +243,13 @@ like this:
 
 ```python
 class Slice:
-  start_key:  bytes        # Inclusive
-  end_key:    bytes        # Exclusive, None for sentinel
+  start_key:  bytes        # Inclusive. Ends at the next slice's start_key.
   endpoints:  list[int]    # Indices into Assignment.endpoint_names
   fallback_disabled: bool  # True when the sharding server assigned no endpoints
 
 class Assignment:
   slices:         list[Slice]  # List of non-overlapping key-range slice assignments
   endpoint_names: list[str]    # Complete list of endpoint names in the assignment
-  generation:     int          # Generation number of the assignment
 ```
 
 #### SliceMap
@@ -263,10 +261,13 @@ performance reasons, we want to avoid having to look up the endpoint name in a
 map, so we will create a new data structure called a `SliceMap` that is
 optimized for lookups. Given a key, it returns a matching key-range. The
 `SliceMap` must be immutable, allowing the Picker to access it without any
-explicit synchronization with the LB policy. The `SliceMap` is meant to be used
-by the `Picker` in conjunction with a list of `PickerEndpoint`s such that the
-list can be swapped out, as long as the number and order of endpoints don't
-change.
+explicit synchronization with the LB policy. The `SliceMap` is used by the
+`Picker` in conjunction with a list of `PickerEndpoint`s, which is kept separate
+from the `SliceMap` so that it can be rebuilt without rebuilding the `SliceMap`.
+This allows state updates from child policies, which are frequent and do not
+change the number or order of endpoints, to reuse the existing `SliceMap`. The
+`SliceMap` is rebuilt whenever the LB policy receives an update from the Name
+Resolver or a new result from the `AutoshardingClient`.
 
 ```python
 class SliceEntry:
@@ -277,7 +278,6 @@ class SliceEntry:
 class SliceMap:
   slices:        list[SliceEntry] # Sorted by start_key
   fallback_pool: list[int]        # Indices into list[PickerEndpoint] for resolver endpoints
-  generation:    int              # Snapshot generation number
 ```
 
 Because assignments are pre-validated to have no gaps and cover the full key
@@ -317,18 +317,15 @@ of them change. Here is the pseudo-code for the logic to build the `SliceMap`:
 def build_slice_map(
     endpoint_map: EndpointMap, assignment: Assignment | Error | None
 ) -> SliceMap:
-  slice_map = SliceMap(slices=[], fallback_pool=[], generation=0)
+  slice_map = SliceMap(slices=[], fallback_pool=[])
 
-  # Populate fallback_pool deterministically sorted by endpoint index.
-  slice_map.fallback_pool = [
-      es.index for es in sorted(endpoint_map.m.values(), key=lambda es: es.index)
-  ]
+  # The fallback pool contains all endpoints, i.e., the indices [0, N-1] into
+  # the Picker's list of PickerEndpoints.
+  slice_map.fallback_pool = list(range(len(endpoint_map.m)))
 
   # No result from the AutoshardingClient yet, or an error.
   if assignment is None or assignment.is_error():
     return slice_map
-
-  slice_map.generation = assignment.generation
 
   # Build SliceEntry for each Slice in the assignment.
   for slice_data in assignment.slices:
@@ -383,37 +380,41 @@ At creation time, the `AutoshardingClient` is passed the following:
   closed.
 * A string that uniquely identifies an assignment in the autosharding service.
   This string is derived from the `autosharding_target` field of the LB policy
-  configuration. If a `%s` token was present in configuration field, the LB
-  policy must replace it with the “Locality” value passed to it as a resolver
-  state attribute.
-  * In xDS use-cases, the “Locality” value is currently populated by the
-    `weighted_target_experimental` LB policy as a resolver state attribute, and
-    is available to all LB policies that sit underneath it.
-    * When the `autosharding_experimental` LB policy is used for endpoint
-      picking alone, it will sit underneath the `weighted_target_experimental`
-      LB policy, and therefore will have access to this resolver attribute. See
-      [gRFC A78][A78] for more details.
-    * When the `autosharding_experimental` LB policy is used for both locality
-      and endpoint picking, the “Locality” value will not be part of the
-      `autosharding_target` field of the LB policy configuration, as the policy
-      will handle endpoints from all localities.
-    * The string representation of an xDS locality is specified in the [Optional
-      xDS Locality
-      Label](https://github.com/grpc/proposal/blob/master/A78-grpc-metrics-wrr-pf-xds.md#optional-xds-locality-label)
-      section of [gRFC A78][A78].
-  * In non-xDS use-cases, the common case is for the `autosharding_target` to
-    not contain `%s` tokens. But if they do, it is the responsibility of the
-    user to ensure that this attribute is populated by the Name Resolver. If
-    this attribute is not available, the LB policy will replace the `%s` token
-    with an empty string.
+  configuration. If this field contains a `%s` token, the LB policy replaces it
+  with the value of the “Locality” resolver state attribute, or with an empty
+  string if that attribute is not present. The LB policy applies this rule
+  regardless of the mode it is being used in (see [Supported modes of
+  operation](#supported-modes-of-operation)), and does not need to know which
+  mode that is. It is the responsibility of whoever generates the LB policy
+  configuration to only use a `%s` token when the “Locality” attribute is
+  expected to be present.
+  * In xDS use-cases, the “Locality” attribute is set by the
+    `weighted_target_experimental` LB policy to the name of its child (which is
+    the string representation of the xDS locality, as specified in the [Optional
+    xDS Locality
+    Label](https://github.com/grpc/proposal/blob/master/A78-grpc-metrics-wrr-pf-xds.md#optional-xds-locality-label)
+    section of [gRFC A78][A78]), and is available to all LB policies underneath
+    it. So, the attribute is present when the `autosharding_experimental` LB
+    policy is used for endpoint picking alone (underneath
+    `weighted_target_experimental`), and is absent when it is used for both
+    locality and endpoint picking, in which case the `autosharding_target` field
+    is not expected to contain a `%s` token, since the policy handles endpoints
+    from all localities.
+  * In non-xDS use-cases, the `autosharding_target` field is typically not
+    expected to contain a `%s` token. If it does, it is the responsibility of
+    the user to ensure that the “Locality” attribute is populated by the Name
+    Resolver.
 * A UUID created by the LB policy at build time. The `AutoshardingClient` must
   reuse this value across stream restarts.
 * A timeout that determines how long to wait for an initial result (a valid
   assignment or an error) from the sharding service. The LB policy passes the
   value of the `initial_assignment_timeout` field from the LB policy
   configuration here.
-* A callback that will receive either a valid assignment or an error from the
-  `AutoshardingClient`.
+* A callback that the `AutoshardingClient` invokes every time it has a result
+  to report to the LB policy. Each invocation is passed either a valid
+  assignment or an error. See [Contract of the
+  AutoshardingClient](#contract-of-the-autoshardingclient) for when each is
+  reported.
 
 #### Contract of the AutoshardingClient
 
@@ -422,34 +423,36 @@ simple and the picker's binary search on the `SliceMap` remains fast and
 correct, the `AutoshardingClient` must produce an `Assignment` that conforms to
 the following rules:
 
-1. The list of `Slices` must cover the entire possible keyspace, starting from
-   the minimum possible key (the empty byte string `b""`) and ending with the
-   maximum possible key (infinity, represented as `None`).
-1. The `Slices` list must be sorted in ascending lexicographical order by
-   `start_key`.
-1. The partitioning must be contiguous and non-overlapping. For every slice
-   index `i` from `0` to `N - 2`, `slices[i].end_key` must exactly equal
-   `slices[i + 1].start_key`.
-1. Any gaps in the key-ranges (whether omitted by the server or created locally
-   because of invalid `Slices` being dropped during validation) must be filled
-   as an entry with an empty `endpoints` list (`[]`) and `fallback_disabled` set
-   to `False`.
-1. For valid `Slices` where the sharding server explicitly specified an empty
-   endpoints list, the `fallback_disabled` must be set to `True`.
+1. The `start_key` of the first `Slice` must be the minimum possible key (the
+   empty byte string `b""`).
+1. The `Slices` list must be sorted in strictly ascending lexicographical order
+   by `start_key`.
+
+Each `Slice` covers the key-range from its `start_key` (inclusive) to the
+`start_key` of the next `Slice` (exclusive), and the last `Slice` extends to the
+end of the keyspace. So, an `Assignment` that conforms to these rules covers the
+entire keyspace with contiguous, non-overlapping key-ranges. The end of a
+key-range is implied by the next `Slice`, and is therefore not stored in the
+`Assignment`. The `end_key` field of the `Slice` messages received from the
+sharding server is only used by the `AutoshardingClient` to validate the
+assignment and to detect gaps (see [Handling assignments from the Autosharding
+server](#handling-assignments-from-the-autosharding-server)).
 
 The `AutoshardingClient` must report valid assignments to the LB policy as and
 when it receives them from the autosharding server. If it encounters errors, it
 must report them to the LB policy **only** if it did not previously report a
-valid assignment. Once a given `AutoshardingClient` reports a valid assignment,
-it does not need to report any errors after that, because the LB policy will
-continue to use the previous valid assignment.
+valid assignment. Once a given `AutoshardingClient` has reported a valid
+assignment, it must not report any errors, since we want the LB policy to keep
+using the most recent valid assignment rather than falling back or failing RPCs.
 
 The `AutoshardingClient` must report the following scenarios as errors (and
 cancel the initial assignment timer if it is still running):
 
-* The stream fails without receiving a valid assignment
-* The stream receives an invalid assignment
-* The initial assignment timer fires before it receives a complete assignment
+* The stream fails without receiving a valid assignment.
+* The stream receives an invalid assignment, i.e., one with no valid `Slices`
+  (see [Handling assignments from the Autosharding
+  server](#handling-assignments-from-the-autosharding-server)).
+* The initial assignment timer fires before it receives a complete assignment.
 
 #### Interaction between LB policy and the AutoshardingClient
 
@@ -478,8 +481,13 @@ Whenever the `AutoshardingClient` returns a result to the LB policy via the
 registered callback, the LB policy updates its `self.assignment` field
 (synchronized with updates from the Name Resolver and child LB policies) and
 updates the channel state and picker, which will retry any queued RPCs.
-Implementations must protect themselves against updates from old clients during
-this switch.
+
+When the LB policy replaces its `AutoshardingClient`, the new one is created
+before the previous one is closed (see [Handling updates from the Name
+Resolver](#handling-updates-from-the-name-resolver)), and results from the
+previous one may already be on their way to the LB policy. The LB policy must
+only process results from its current `AutoshardingClient`, and must ignore
+results from any previous one.
 
 ```python
 def on_assignment_update(self, assignment: Assignment | Error):
@@ -578,11 +586,16 @@ Once the `AssignmentMetadata` message is received, the `AutoshardingClient`
 validates the assignment as follows:
 
 1. The `generation` in `AssignmentMetadata` is strictly greater than any
-   previously accepted generation.
-2. Each `Slice` has `start_key < end_key`, non-overlapping key-ranges, and
-   all indices into the combined endpoint list are valid. `Slice`s that fail
-   validation are treated as gaps. In the case of overlaps, all overlapping
-   slices are invalid and treated as gaps.
+   previously accepted generation. An assignment with a stale generation is
+   dropped, and is not reported as an error to the LB policy.
+2. Each `Slice` has a `start_key` and an `end_key` that are at most 512 bytes
+   long (as specified by the [Autosharding][Autosharding] protocol),
+   `start_key < end_key`, non-overlapping key-ranges, and all indices into the
+   combined endpoint list are valid. `Slice`s that fail validation are treated
+   as gaps. In the case of overlaps, all overlapping slices are invalid and
+   treated as gaps. If no valid `Slices` remain (including when the assignment
+   contains no `Slices` at all), the assignment is invalid, and is reported as
+   an error to the LB policy.
 
 The `AutoshardingClient` then replies with an `AssignmentAck` (carrying the
 received `generation`) and notifies the LB policy according to the outcome:
@@ -606,11 +619,12 @@ builds a new `SliceMap` and `Picker` to update the channel.
 #### Handling gaps in the assignment
 
 Gaps in the key-ranges represented by the `Slices` within an assignment are
-allowed, but are not common. In this case, the `AutoshardingClient` must fill
-these gaps with `Slices` that contain no endpoints and accept the assignment as
-valid. It will also include an error message in the `AssignmentAck` indicating
-the gap. Requests that match these gaps will use the fallback pool (if enabled)
-or fail.
+allowed, but are not common. Gaps are also created when `Slices` that fail
+validation are dropped. In either case, the `AutoshardingClient` must fill these
+gaps with `Slices` that contain no endpoints and have `fallback_disabled` set to
+`False`, and accept the assignment as valid. It will also include an error
+message in the `AssignmentAck` indicating the gap. Requests that match these
+gaps will use the fallback pool (if enabled) or fail.
 
 #### Handling Slices with no endpoints
 
@@ -622,9 +636,12 @@ tenant ID.  In this case, the first and last `Slice` in the assignment will
 contain no endpoints, while middle slices will cover single tenant keys.  We
 want to disable fallback for `Slices` where the sharding server has not
 specified any endpoints, even if fallback is enabled in the LB policy
-configuration. This is handled by propagating a `fallback_disabled` flag from
-the `AutoshardingClient` all the way to the picker, and is described in detail
-in sections on [fallback](#fallback-mechanism) and on the [Picker](#the-picker).
+configuration. To handle this, the `AutoshardingClient` must set
+`fallback_disabled` to `True` for valid `Slices` for which the sharding server
+explicitly specified an empty list of endpoints (as opposed to the `Slices` it
+creates to fill gaps, for which it is set to `False`). This flag is propagated
+all the way to the picker, as described in the sections on
+[fallback](#fallback-mechanism) and on the [Picker](#the-picker).
 
 ### Fallback Mechanism
 
