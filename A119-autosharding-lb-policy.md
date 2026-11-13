@@ -830,13 +830,62 @@ def connect_to_random_idle_endpoint(self):
     random.choice(idle_endpoints).request_connection()
 ```
 
+The LB policy invokes `update_state_and_picker()` whenever it receives an update
+from the Name Resolver, a state update from a child policy, or a result from the
+`AutoshardingClient`. It computes the new connectivity state and picker, and
+reports them to the channel.
+
+```python
+def update_state_and_picker(self):
+  if self.resolver_error is not None:
+    self.clear_initial_connect()
+    self.update_channel_state(TRANSIENT_FAILURE, ErrorPicker(self.resolver_error))
+    return
+
+  # If the LB policy is yet to receive an assignment or error from the
+  # AutoshardingClient, RPCs must be queued.
+  if self.assignment is None:
+    self.update_channel_state(CONNECTING, QueuePicker())
+    return
+
+  # If the LB policy received an error from the AutoshardingClient and
+  # fallback is disabled, RPCs must be failed.
+  if self.assignment.is_error() and not self.config.enable_fallback:
+    self.clear_initial_connect()
+    self.update_channel_state(
+        TRANSIENT_FAILURE, ErrorPicker(self.assignment.error())
+    )
+    return
+
+  # Compute the channel's aggregated connectivity state. This also clears
+  # initial_connect_pending when the first endpoint moves out of IDLE.
+  agg_state = self.compute_aggregated_connectivity_state()
+
+  # If no endpoint has moved out of IDLE yet, report CONNECTING instead of IDLE,
+  # and do not proactively trigger connection attempts. See "Initial connection
+  # behavior".
+  if agg_state == IDLE and self.initial_connect_pending:
+    self.update_channel_state(CONNECTING, self.build_picker())
+    return
+
+  # If aggregated state is TRANSIENT_FAILURE or CONNECTING, request a connection
+  # on a random IDLE endpoint (if any), unless an endpoint is already
+  # CONNECTING.
+  if agg_state in (TRANSIENT_FAILURE, CONNECTING):
+    self.connect_to_random_idle_endpoint()
+
+  # Build new picker and update the channel.
+  picker = self.build_picker()
+  self.update_channel_state(agg_state, picker)
+```
+
 ### Handling updates from child policies
 
 When the LB policy receives a state update from one of its child policies
 containing the new connectivity state and picker for the child policy, it
 updates the `EndpointState` that owns that child policy and invokes
-`update_state_and_picker()` (shown in the [Handling updates from the Name
-Resolver](#handling-updates-from-the-name-resolver) section below).
+`update_state_and_picker()` (shown in the [Aggregated Connectivity
+State](#aggregated-connectivity-state) section above).
 
 Implementations must not identify the `EndpointState` to update by looking up
 the endpoint's hostname in the `EndpointMap`. A Name Resolver update may have
@@ -1047,48 +1096,6 @@ def handle_name_resolver_update(
 
   self.update_state_and_picker()
   return OK
-
-def update_state_and_picker(self):
-  if self.resolver_error is not None:
-    self.clear_initial_connect()
-    self.update_channel_state(TRANSIENT_FAILURE, ErrorPicker(self.resolver_error))
-    return
-
-  # If the LB policy is yet to receive an assignment or error from the
-  # AutoshardingClient, RPCs must be queued.
-  if self.assignment is None:
-    self.update_channel_state(CONNECTING, QueuePicker())
-    return
-
-  # If the LB policy received an error from the AutoshardingClient and
-  # fallback is disabled, RPCs must be failed.
-  if self.assignment.is_error() and not self.config.enable_fallback:
-    self.clear_initial_connect()
-    self.update_channel_state(
-        TRANSIENT_FAILURE, ErrorPicker(self.assignment.error())
-    )
-    return
-
-  # Compute the channel's aggregated connectivity state. This also clears
-  # initial_connect_pending when the first endpoint moves out of IDLE.
-  agg_state = self.compute_aggregated_connectivity_state()
-
-  # If no endpoint has moved out of IDLE yet, report CONNECTING instead of IDLE,
-  # and do not proactively trigger connection attempts. See "Initial connection
-  # behavior".
-  if agg_state == IDLE and self.initial_connect_pending:
-    self.update_channel_state(CONNECTING, self.build_picker())
-    return
-
-  # If aggregated state is TRANSIENT_FAILURE or CONNECTING, request a connection
-  # on a random IDLE endpoint (if any), unless an endpoint is already
-  # CONNECTING. See "Aggregated Connectivity State".
-  if agg_state in (TRANSIENT_FAILURE, CONNECTING):
-    self.connect_to_random_idle_endpoint()
-
-  # Build new picker and update the channel.
-  picker = self.build_picker()
-  self.update_channel_state(agg_state, picker)
 ```
 
 ### The Picker
