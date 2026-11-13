@@ -1159,8 +1159,9 @@ class Picker:
     return all(self.endpoints[i].state == TRANSIENT_FAILURE for i in indices)
 
   def pick(self, pick_args: PickArgs) -> PickResult:
-    # Extract sharding key from request metadata/header. If the key contains
-    # multiple values, use the first one.
+    # Extract sharding key from request metadata/header. If the header has
+    # multiple values, they are joined with a "," character (no whitespace),
+    # as is done for `request_hash_header` in gRFC A76.
     key = extract_key_from_metadata(pick_args, self.lb_config.key_header_name)
     if key is None:
       # Drop wait_for_ready RPCs to avoid retries that would fail the same way.
