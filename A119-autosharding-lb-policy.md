@@ -1170,6 +1170,7 @@ class Picker:
     # multiple values, use the first one.
     key = extract_key_from_metadata(pick_args, self.lb_config.key_header_name)
     if key is None:
+      # Drop wait_for_ready RPCs to avoid retries that would fail the same way.
       return PICK_DROP(Internal)
 
     # Lookup matching slice range index and SliceEntry
@@ -1188,6 +1189,7 @@ class Picker:
     # fallback is disabled regardless of lb_config.enable_fallback.
     slice_entry = self.slice_map.slices[slice_idx]
     if slice_entry.fallback_disabled:
+      # Do not drop as a later assignment may add endpoints to the slice.
       return PICK_FAILED(Unavailable)
 
     # Matching key range is in fallback mode and fallback is enabled
@@ -1575,9 +1577,9 @@ as well, as it will quickly wind up establishing connections to all endpoints.
 
 When the `priority` LB policy is an ancestor of this policy, it starts a
 failover timer when a child is created, cancels it when the child reports
-`READY` or `IDLE`, and starts a new one when the child moves from `READY` or
-`IDLE` to `CONNECTING` (see [gRFC A56][A56]). A child that reports `IDLE` is
-considered usable, and lower priorities are deactivated.
+`READY`, `IDLE`, or `TRANSIENT_FAILURE`, and starts a new one when the child
+moves from `READY` or `IDLE` to `CONNECTING` (see [gRFC A56][A56]). A child that
+reports `IDLE` is considered usable, and lower priorities are deactivated.
 
 Reporting `IDLE` while waiting for the first assignment would prevent
 `priority` from failing over if the sharding service does not respond. And
