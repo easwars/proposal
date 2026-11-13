@@ -3,7 +3,7 @@ A119: Auto-Sharding LB Policy
 * Author: easwars
 * Approver: markdroth
 * Implemented in: Go
-* Last updated: 2026-11-09
+* Last updated: 2026-11-13
 * Discussion at: <https://groups.google.com/g/grpc-io/c/BXcwH6ytqRs>
 
 ## Abstract
@@ -111,7 +111,7 @@ from its configuration:
   endpoint shall serve as the hostname. The endpoint hostname attribute
   described in [gRFC A81][A81] will be used here.
 * A "Channel Factory" that returns a fully functional gRPC Channel to the
-  sharding service, given an opaque string specified in the configuration
+  sharding service, given an opaque string specified in the configuration.
 
 #### EndpointMap
 
@@ -302,7 +302,7 @@ def lookup(self, key: bytes) -> int | None:
 
   # Exact match on start_key.
   if found:
-      return idx
+    return idx
 
   # Key falls in range [slices[idx - 1].start_key, slices[idx].start_key).
   return idx - 1
@@ -314,7 +314,9 @@ The `SliceMap` is generated from the `EndpointMap` and `Assignment` when either
 of them change. Here is the pseudo-code for the logic to build the `SliceMap`:
 
 ```python
-def build_slice_map(endpoint_map: EndpointMap, assignment: Assignment | Error) -> SliceMap:
+def build_slice_map(
+    endpoint_map: EndpointMap, assignment: Assignment | Error | None
+) -> SliceMap:
   slice_map = SliceMap(slices=[], fallback_pool=[], generation=0)
 
   # Populate fallback_pool deterministically sorted by endpoint index.
@@ -322,8 +324,9 @@ def build_slice_map(endpoint_map: EndpointMap, assignment: Assignment | Error) -
       es.index for es in sorted(endpoint_map.m.values(), key=lambda es: es.index)
   ]
 
-  if assignment.is_error():
-      return slice_map
+  # No result from the AutoshardingClient yet, or an error.
+  if assignment is None or assignment.is_error():
+    return slice_map
 
   slice_map.generation = assignment.generation
 
@@ -333,6 +336,7 @@ def build_slice_map(endpoint_map: EndpointMap, assignment: Assignment | Error) -
       start_key=slice_data.start_key,
       endpoints=[],
       fallback_disabled=slice_data.fallback_disabled,
+    )
 
     for idx in slice_data.endpoints:
       # Map index -> hostname -> EndpointState.index
@@ -427,8 +431,8 @@ the following rules:
    index `i` from `0` to `N - 2`, `slices[i].end_key` must exactly equal
    `slices[i + 1].start_key`.
 1. Any gaps in the key-ranges (whether omitted by the server or created locally
-   because of  invalid `Slices` being dropped during validation) must be filled
-   as an entry with an empty`endpoints` list (`[]`) and `fallback_disabled` set
+   because of invalid `Slices` being dropped during validation) must be filled
+   as an entry with an empty `endpoints` list (`[]`) and `fallback_disabled` set
    to `False`.
 1. For valid `Slices` where the sharding server explicitly specified an empty
    endpoints list, the `fallback_disabled` must be set to `True`.
@@ -637,18 +641,19 @@ A `SliceEntry` ends up with an empty list of endpoints in four scenarios:
 * Assignment sent by the sharding server contained gaps.
 * `Slice` failed validation and was treated as a gap.
 * None of the `Slice`'s endpoint names were found in the list reported by the
- Name Resolver.
+  Name Resolver.
 * The sharding server sent a `Slice` containing no endpoint names.
 
-The first three scenaiors are treated the same by the picker because the
+The first three scenarios are treated the same by the picker because the
 `SliceEntry` will have the `fallback_disabled` field set to `False`. RPCs
-matching these slices will uses the fallback pool when fallback is enabled.
+matching these slices will use the fallback pool when fallback is enabled.
 
 For the last scenario alone, per-slice fallback is **disabled** regardless of
 whether fallback is enabled in the LB policy configuration, causing RPCs
 matching these slices to fail.
 
 #### Per-slice fallback
+
 This happens when the LB policy contains valid endpoints and assignments, and
 for the matching `SliceEntry`, `fallback_disabled` is `False` and either:
 
@@ -711,7 +716,7 @@ When parsing the JSON LB configuration, the LB policy must ensure that the
 rejected.
 
 Key considerations regarding the LB policy configuration that must be handled by
-the "Channel Factory".
+the "Channel Factory":
 
 * The configuration deliberately omits credentials to be used for the
   communication with the sharding service. This decision prevents potential
@@ -812,9 +817,10 @@ attempts at the same time, in line with the behavior specified for `ring_hash`
 in [gRFC A117][A117]. This rule is not applied while `initial_connect_pending`
 is set. See [Initial connection behavior](#initial-connection-behavior).
 
-The same function is used to trigger connection attempts that are not caused
-by picks in [Initial connection behavior](#initial-connection-behavior) and
-[Handling requests to exit IDLE](#handling-requests-to-exit-idle).
+This rule is implemented by `connect_to_random_idle_endpoint()` below, which is
+also used to trigger connection attempts that are not caused by picks in
+[Initial connection behavior](#initial-connection-behavior) and [Handling
+requests to exit IDLE](#handling-requests-to-exit-idle).
 
 ```python
 # Triggers a connection attempt to a random IDLE endpoint, unless a connection
@@ -945,9 +951,9 @@ following happens:
   harmless.
 
 When `initial_connect_pending` is set and a result is available from the
-`AutoshardingClient`, the LB policy reports `CONNECTING` instead of the
-aggregated state, and does not apply the proactive connection rule from the
-[Aggregated Connectivity State](#aggregated-connectivity-state) section.
+`AutoshardingClient`, the LB policy reports `CONNECTING` instead of `IDLE`, and
+does not apply the proactive connection rule from the [Aggregated Connectivity
+State](#aggregated-connectivity-state) section.
 
 When the first usable result (a valid assignment, or an error with fallback
 enabled) is received while the flag is set, the LB policy starts a 500ms timer
@@ -1029,6 +1035,8 @@ def exit_idle(self):
       self.start_initial_connect_timer()
     else:
       self.seen_exit_idle = True
+  # current_state is the state most recently reported via
+  # update_channel_state().
   if self.current_state == IDLE:
     self.connect_to_random_idle_endpoint()
 ```
@@ -1045,10 +1053,8 @@ def handle_name_resolver_update(
   # Reset the most recent resolver error.
   self.resolver_error = None
 
-  # Update the EndpointMap with the new set of filtered endpoints and lazily
-  # create/remove `pick_first` child policies for each endpoint.
+  # Update the EndpointMap with the new set of endpoints.
   self.update_endpoint_map(state.endpoints)
-  self.update_child_policies()
   self.slice_map = build_slice_map(self.endpoint_map, self.assignment)
 
   # Fail if there are no valid endpoints.
@@ -1118,7 +1124,7 @@ class Picker:
   def __init__(self, endpoint_map: EndpointMap, slice_map: SliceMap, lb_config: LbConfig):
     self.slice_map             = slice_map
     self.lb_config             = lb_config
- 
+
     # Build immutable snapshot of PickerEndpoints sorted by EndpointState.index.
     self.endpoints = [
         PickerEndpoint(
@@ -1128,7 +1134,7 @@ class Picker:
         )
         for es in sorted(endpoint_map.m.values(), key=lambda es: es.index)
     ]
- 
+
     # Precompute in_fallback status for each slice.
     self.slice_in_fallback = [
         self._is_pool_in_fallback(se.endpoints)
@@ -1204,7 +1210,7 @@ class Picker:
 
       # If IDLE, trigger connection on the child LB (at most one per pick)
       if not requested_connection and endpoint.state == IDLE:
-        endpoint.request_connection()
+        endpoint.endpoint.request_connection()
         requested_connection = True
 
     # If no READY endpoint was found, but we requested a connection or found a
@@ -1252,7 +1258,7 @@ option.
 
 The “Channel Factory” or provider is defined as a function type that accepts a
 string key, and returns a gRPC channel. The existing `grpc.ClientConnInterface`
-interface, instead of the concrete `*grpc.ClientConn` type,  is used to
+interface, instead of the concrete `*grpc.ClientConn` type, is used to
 represent a gRPC channel, to allow for wrapping. The LB policy can create a
 client stub to the sharding service by passing this interface to the protobuf
 generated code and make RPCs using that client stub.
@@ -1389,7 +1395,7 @@ support two new bits of functionality, as follows:
 In Go, the existing `Converter` type will be modified as follows:
 
 ```golang
-package xdslbregistry/converter
+package converter
 
 // ConverterOptions contains options passed to the Converter.
 type ConverterOptions struct {
@@ -1407,7 +1413,7 @@ type ConverterOptions struct {
 }
 
 // Converter converts raw proto bytes into JSON LB policy configuration.
-// 
+//
 // Returns the following:
 // - converted JSON form of the LB policy configuration
 // - Any error encountered during the conversion.
